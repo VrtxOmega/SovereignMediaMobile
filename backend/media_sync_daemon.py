@@ -11,11 +11,14 @@ import os
 import aiohttp
 from aiohttp import web
 from pathlib import Path
+from tinytag import TinyTag
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # Config
 PORT = 5002
 DB_PATH = os.path.expanduser('~/.veritas/media_state.db')
-CONFIG_PATH = Path(os.path.expanduser('~/AppData/Roaming/omega-audio-player/omega_audio_library.json'))
+AUDIOBOOKS_DIR = Path(os.path.expanduser('~/Audiobooks'))
 
 connected_clients = set()
 
@@ -78,54 +81,94 @@ def get_position(track_id):
         return {'position_ms': row[0], 'is_paused': bool(row[1]), 'updated_at': row[2]}
     return {'position_ms': 0, 'is_paused': True, 'updated_at': 0}
 
-def get_library_json():
-    """Reads the JSON directly written by the Desktop Electron Player."""
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, 'r', encoding='utf8') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"[SYNC] Failed to read database: {e}")
-    return {"albums": []}
+class LibraryState:
+    def __init__(self):
+        self.albums = []
+        self.track_paths = {}
+        self.cover_paths = {}
+
+library_state = LibraryState()
+
+def build_library():
+    print("[SYNC] Scanning library...")
+    AUDIOBOOKS_DIR.mkdir(parents=True, exist_ok=True)
+    new_albums = {}
+    new_track_paths = {}
+    new_cover_paths = {}
+    
+    for p in AUDIOBOOKS_DIR.rglob('*'):
+        if p.is_file() and p.suffix.lower() in ['.mp3', '.m4b', '.m4a']:
+            try:
+                tag = TinyTag.get(str(p), image=True)
+                
+                album_title = tag.album or p.parent.name
+                if album_title == AUDIOBOOKS_DIR.name:
+                    album_title = p.stem
+                    
+                track_title = tag.title or p.stem
+                duration = int(tag.duration * 1000) if tag.duration else 0
+                track_no = tag.track if tag.track else 1
+                
+                track_path_str = str(p)
+                track_id = hashlib.sha256(track_path_str.encode('utf-8')).hexdigest()[:16]
+                album_id = hashlib.sha256(album_title.encode('utf-8')).hexdigest()[:16]
+                
+                if album_id not in new_albums:
+                    new_albums[album_id] = {
+                        "id": album_id,
+                        "title": album_title,
+                        "artist": tag.artist or tag.albumartist or "Unknown",
+                        "tracks": []
+                    }
+                    
+                    cover_path = p.parent / "cover.jpg"
+                    if not cover_path.exists() and tag.get_image() is not None:
+                        with open(cover_path, 'wb') as f:
+                            f.write(tag.get_image())
+                    if cover_path.exists():
+                        new_cover_paths[album_id] = cover_path
+                        new_albums[album_id]["coverArt"] = f"http://localhost:{PORT}/cover/{album_id}"
+                        
+                new_albums[album_id]["tracks"].append({
+                    "id": track_id,
+                    "title": track_title,
+                    "filename": p.name,
+                    "path": track_path_str,
+                    "duration": duration,
+                    "trackNo": track_no
+                })
+                new_track_paths[track_id] = track_path_str
+                
+            except Exception as e:
+                print(f"[SYNC] Error parsing {p}: {e}")
+
+    for album in new_albums.values():
+        album["tracks"].sort(key=lambda t: int(t["trackNo"]) if str(t["trackNo"]).isdigit() else 0)
+
+    library_state.albums = list(new_albums.values())
+    library_state.track_paths = new_track_paths
+    library_state.cover_paths = new_cover_paths
+    print(f"[SYNC] Library rebuilt: {len(library_state.albums)} albums.")
+
+class LibraryHandler(FileSystemEventHandler):
+    def on_any_event(self, event):
+        if event.is_directory: return
+        if event.src_path.lower().endswith(('.mp3', '.m4b', '.m4a')):
+            build_library()
 
 def get_track_path(track_id):
-    data = get_library_json()
-    for album in data.get('albums', []):
-        for track in album.get('tracks', []):
-            # Fallback to computing deterministic ID if missing
-            computed_id = track.get('id')
-            if not computed_id and track.get('path'):
-                computed_id = hashlib.sha256(track.get('path').encode('utf-8')).hexdigest()[:16]
-                
-            if computed_id == track_id or track.get('filename') == track_id:
-                return track.get('path')
-    return None
+    return library_state.track_paths.get(track_id)
 
 def get_cover_path(album_id):
-    data = get_library_json()
-    for album in data.get('albums', []):
-        if album.get('id') == album_id:
-            cover_art = album.get('coverArt')
-            # It might look like file:///... or an absolute path
-            if cover_art:
-                if cover_art.startswith('file:///'):
-                    return Path(cover_art.replace('file:///', ''))
-                return Path(cover_art)
-    return None
+    return library_state.cover_paths.get(album_id)
 
 def scan_grouped_library():
     """
-    Returns the library grouped by Albums exactly as the app needs it.
-    (Takes directly from desktop json config)
+    Returns the library grouped by Albums, injecting live playhead state.
     """
-    data = get_library_json()
-    albums = data.get('albums', [])
+    albums = library_state.albums
     for album in albums:
         for track in album.get('tracks', []):
-            # Inject deterministic ID if track lacks one
-            if not track.get('id') and track.get('path'):
-                track['id'] = hashlib.sha256(track.get('path').encode('utf-8')).hexdigest()[:16]
-                
             state = get_position(track.get('id'))
             track['lastPositionMs'] = state.get('position_ms', 0)
             track['lastPlayedAt'] = state.get('updated_at', 0)
@@ -308,6 +351,12 @@ async def handle_ws(request):
 
 if __name__ == '__main__':
     init_db()
+    build_library()
+    
+    observer = Observer()
+    observer.schedule(LibraryHandler(), str(AUDIOBOOKS_DIR), recursive=True)
+    observer.start()
+    
     app = web.Application()
     app.router.add_get('/ws', handle_ws)
     app.router.add_get('/library', handle_library)
@@ -316,4 +365,8 @@ if __name__ == '__main__':
     app.router.add_post('/api/sync', handle_sync_http)
     
     print(f"[SYNC] Launching unified aiohttp telemetry node on port {PORT}")
-    web.run_app(app, host='0.0.0.0', port=PORT, print=None)
+    try:
+        web.run_app(app, host='0.0.0.0', port=PORT, print=None)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
