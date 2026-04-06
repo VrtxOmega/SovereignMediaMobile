@@ -14,8 +14,9 @@ import OfflineBufferService from './src/services/OfflineBufferService';
 import StateLedgerService from './src/services/StateLedgerService';
 
 import LibraryScreen from './src/screens/LibraryScreen';
+import BooksScreen from './src/screens/BooksScreen';
+import VideoScreen from './src/screens/VideoScreen';
 import NowPlayingScreen from './src/screens/NowPlayingScreen';
-import DownloadsScreen from './src/screens/DownloadsScreen';
 import IPConfigScreen from './src/screens/IPConfigScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import AlbumScreen from './src/screens/AlbumScreen';
@@ -24,7 +25,7 @@ const Tab = createBottomTabNavigator();
 const Stack = createStackNavigator();
 
 const TabIcon = ({ label, focused }) => {
-  const icons = { Library: '⊟', Downloads: '⬡' };
+  const icons = { Audio: '♫', Books: '📖', Video: '▶', System: '⚙' };
   return (
     <View style={tabStyles.wrapper}>
       <Text style={[tabStyles.icon, { color: focused ? colors.gold : colors.goldDim }]}>
@@ -47,6 +48,7 @@ function MainTabs() {
   return (
     <Tab.Navigator
       screenOptions={{
+        headerShown: false,
         headerStyle: {
           backgroundColor: colors.obsidianLight,
           borderBottomWidth: 1,
@@ -69,24 +71,32 @@ function MainTabs() {
         name="Library"
         component={LibraryScreen}
         options={{
-          title: 'Ω SOVEREIGN AUDIO',
-          tabBarIcon: ({ focused }) => <TabIcon label="Library" focused={focused} />,
+          title: 'AUDIO',
+          tabBarIcon: ({ focused }) => <TabIcon label="Audio" focused={focused} />,
         }}
       />
       <Tab.Screen
-        name="Downloads"
-        component={DownloadsScreen}
+        name="Books"
+        component={BooksScreen}
         options={{
-          title: 'OFFLINE BUFFER',
-          tabBarIcon: ({ focused }) => <TabIcon label="Downloads" focused={focused} />,
+          title: 'EBOOKS',
+          tabBarIcon: ({ focused }) => <TabIcon label="Books" focused={focused} />,
+        }}
+      />
+      <Tab.Screen
+        name="Video"
+        component={VideoScreen}
+        options={{
+          title: 'MOVIES',
+          tabBarIcon: ({ focused }) => <TabIcon label="Video" focused={focused} />,
         }}
       />
       <Tab.Screen
         name="Settings"
         component={SettingsScreen}
         options={{
-          title: 'SYSTEM CONF',
-          tabBarIcon: ({ focused }) => <Text style={{ color: focused ? colors.gold : colors.goldDim, fontSize: 18 }}>⚙</Text>,
+          title: 'SYSTEM',
+          tabBarIcon: ({ focused }) => <TabIcon label="System" focused={focused} />,
         }}
       />
     </Tab.Navigator>
@@ -110,7 +120,7 @@ export default function App() {
         } else {
           setInitialRoute('IPConfig');
         }
-        console.log('[APP] Sovereign Audio initialized');
+        console.log('[APP] Sovereign Media initialized');
       } catch (err) {
         console.error('[APP] Initialization failed:', err);
         setInitialRoute('IPConfig');

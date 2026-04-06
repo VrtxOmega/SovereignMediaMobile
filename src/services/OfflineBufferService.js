@@ -60,7 +60,7 @@ class OfflineBufferService {
       const maxVaultBytes = vaultGb * 1024 * 1024 * 1024;
       const currentVault = await this.getPersistentSize();
       
-      if (currentVault + size > maxVaultBytes) {
+      if (vaultGb !== -1 && currentVault + size > maxVaultBytes) {
         console.log(`[BUFFER:VAULT] Reached Vault Limit (${vaultGb}GB). Download aborted.`);
         this._emit('download_error', { trackId, error: `Vault limit reached (${vaultGb}GB)` });
         return;
@@ -72,7 +72,7 @@ class OfflineBufferService {
       const maxBytes = limitGb * 1024 * 1024 * 1024;
       
       const currentSize = await this.getTransientSize();
-      if (currentSize + size > maxBytes) {
+      if (limitGb !== -1 && currentSize + size > maxBytes) {
         console.log(`[BUFFER:STREAM] Limit reached (${limitGb}GB) — clearing oldest buffers`);
         await this._evictOldest(size);
       }

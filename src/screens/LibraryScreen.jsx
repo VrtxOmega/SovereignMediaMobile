@@ -5,23 +5,30 @@ import {
 } from 'react-native';
 import { colors, spacing, radius, typography } from '../theme/veritas';
 import MediaSyncService from '../services/MediaSyncService';
+import OfflineBufferService from '../services/OfflineBufferService';
+import { SovereignHeader, SovereignFooter } from '../components/SovereignBranding';
+import SovereignActionSheet from '../components/SovereignActionSheet';
 
 const { width: SCREEN_W } = Dimensions.get('window');
 const COLS = 2; // Bigger cards for albums
 const CARD_SIZE = (SCREEN_W - spacing.lg * 2 - spacing.sm * (COLS - 1)) / COLS;
 
-const AlbumCard = React.memo(({ album, onPress }) => {
+const AlbumCard = React.memo(({ album, onPress, onLongPress }) => {
   const coverUri = MediaSyncService.getHttpUrl(`/cover/${album.id}`);
   
   return (
     <TouchableOpacity
       style={styles.card}
       onPress={() => onPress(album)}
+      onLongPress={() => onLongPress(album)}
       activeOpacity={0.7}
     >
       <View style={styles.coverWrapper}>
         <Image 
-          source={{ uri: coverUri }} 
+          source={{ 
+            uri: coverUri,
+            headers: { 'Bypass-Tunnel-Reminder': 'true', 'User-Agent': 'localtunnel' }
+          }} 
           style={styles.cover} 
           resizeMode="cover" 
           defaultSource={null}
@@ -52,6 +59,8 @@ export default function LibraryScreen({ navigation }) {
   const [refreshing, setRefreshing] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
   const [mode, setMode] = useState(MediaSyncService.mode || 'offline');
+  const [actionSheetVisible, setActionSheetVisible] = useState(false);
+  const [selectedAlbum, setSelectedAlbum] = useState(null);
 
   useEffect(() => {
     const unsubLib = MediaSyncService.on('LIBRARY_RESPONSE', (data) => {
@@ -98,16 +107,44 @@ export default function LibraryScreen({ navigation }) {
     navigation.navigate('Album', { album });
   }, [navigation]);
 
+  const handleAlbumLongPress = useCallback((album) => {
+    setSelectedAlbum(album);
+    setActionSheetVisible(true);
+  }, []);
+
   const renderAlbum = useCallback(({ item }) => (
-    <AlbumCard album={item} onPress={handleAlbumPress} />
-  ), [handleAlbumPress]);
+    <AlbumCard album={item} onPress={handleAlbumPress} onLongPress={handleAlbumLongPress} />
+  ), [handleAlbumPress, handleAlbumLongPress]);
+
+  const handleDownloadAll = async () => {
+    if (!selectedAlbum || !selectedAlbum.tracks) return;
+    for (const track of selectedAlbum.tracks) {
+      const url = MediaSyncService.getHttpUrl(`/stream/${track.id}`);
+      await OfflineBufferService.queueDownload(track.id, url, track.filename || `${track.id}.mp3`, track.size || 5000000, {
+        albumId: selectedAlbum.id,
+        albumName: selectedAlbum.name,
+        artist: selectedAlbum.artist,
+      }, false);
+    }
+  };
+
+  const handleRemoveAll = () => {
+    if (!selectedAlbum) return;
+    const buffered = OfflineBufferService.getBufferedTracks();
+    buffered.forEach(tid => {
+       const info = OfflineBufferService.getBufferInfo(tid);
+       if (info && info.albumData && info.albumData.albumId === selectedAlbum.id) {
+           OfflineBufferService.deleteBuffer(tid);
+       }
+    });
+  };
 
   return (
     <View style={styles.container}>
       <View style={styles.header}>
+        <SovereignHeader />
         <View style={styles.headerTop}>
           <View>
-            <Text style={styles.headerTitle}>LIBRARY</Text>
             <Text style={styles.headerCount}>{filtered.length} collections</Text>
           </View>
           <ModeIndicator mode={mode} />
@@ -141,10 +178,21 @@ export default function LibraryScreen({ navigation }) {
           columnWrapperStyle={styles.row}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.gold} />}
           showsVerticalScrollIndicator={false}
+          ListFooterComponent={<SovereignFooter />}
         />
       )}
       
       <FloatingMediaBar navigation={navigation} />
+
+      <SovereignActionSheet
+        visible={actionSheetVisible}
+        onClose={() => setActionSheetVisible(false)}
+        title={selectedAlbum?.name}
+        options={[
+          { label: '🌩 DOWNLOAD ALBUM', onPress: handleDownloadAll },
+          { label: '✖ REMOVE CACHE', destructive: true, onPress: handleRemoveAll },
+        ]}
+      />
     </View>
   );
 }

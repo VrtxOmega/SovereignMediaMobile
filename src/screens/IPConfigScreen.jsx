@@ -23,7 +23,7 @@ export default function IPConfigScreen({ navigation }) {
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
     >
       <View style={styles.card}>
-        <Text style={styles.title}>SOVEREIGN AUDIO</Text>
+        <Text style={styles.title}>SOVEREIGN MEDIA</Text>
         <Text style={styles.subtitle}>NODE UNAUTHENTICATED</Text>
         
         <Text style={styles.label}>ENTER DESKTOP IP ADDRESS</Text>

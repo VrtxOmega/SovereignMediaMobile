@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity,
-  StyleSheet, Alert, ProgressBarAndroid,
+  StyleSheet, Alert, Image,
 } from 'react-native';
 import { colors, spacing, radius, typography } from '../theme/veritas';
 import OfflineBufferService from '../services/OfflineBufferService';
@@ -175,7 +175,7 @@ export default function DownloadsScreen() {
   const handleClearAll = () => {
     Alert.alert(
       'Clear All Buffers',
-      `Delete all ${Object.keys(bufferedTracks).length} buffered files (${formatBytes(bufferSizeBytes)})?`,
+      `Delete all ${Object.keys(bufferedTracks).length} buffered files (${formatBytes(transientSizeBytes)})?`,
       [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Clear All', style: 'destructive', onPress: () => OfflineBufferService.clearAllBuffers() }

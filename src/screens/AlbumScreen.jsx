@@ -2,6 +2,7 @@ import React, { useCallback, useState, useEffect } from 'react';
 import { View, Text, FlatList, TouchableOpacity, StyleSheet, Image, Dimensions } from 'react-native';
 import { colors, spacing, radius, typography } from '../theme/veritas';
 import MediaSyncService from '../services/MediaSyncService';
+import { SovereignFooter } from '../components/SovereignBranding';
 
 const { width: SCREEN_W } = Dimensions.get('window');
 
@@ -156,6 +157,7 @@ export default function AlbumScreen({ route, navigation }) {
         keyExtractor={item => item.id}
         contentContainerStyle={styles.trackList}
         showsVerticalScrollIndicator={false}
+        ListFooterComponent={<SovereignFooter />}
       />
     </View>
   );
