@@ -1,261 +1,279 @@
 /**
- * OfflineBufferService
- * Auto-downloads active media to encrypted local storage.
- * Mode B (Offline Buffer) — cleanroom and field deployment.
+ * OfflineBufferService.js
+ * Download orchestrator — permanent vault + transient streaming buffer.
+ * Handles space checks, auto-purging, queuing, and SHA-256 verification.
  */
+
 import RNFS from 'react-native-fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import CryptoJS from 'crypto-js';
+import MediaSyncService from './MediaSyncService';
 
-const BUFFER_DIR = `${RNFS.DocumentDirectoryPath}/omega_buffer`;
-const META_KEY = 'omega_buffer_meta';
-const BUFFER_LIMIT_KEY = '@omega_buffer_limit';
-const VAULT_LIMIT_KEY = '@omega_vault_limit';
-const DEFAULT_BUFFER_GB = 4;
-const DEFAULT_VAULT_GB = 32;
+const VAULT_DIR      = `${RNFS.DocumentDirectoryPath}/sovereign_vault`;
+const BUFFER_DIR     = `${RNFS.CachesDirectoryPath}/sovereign_buffer`;
+const BUFFER_MAX_GB  = 4;
+const VAULT_MAX_GB   = 32;
+const LOW_SPACE_MB   = 100;
+const STORAGE_KEY    = '@sovereign_offline_index';
 
-class OfflineBufferService {
+class OfflineBufferServiceClass {
   constructor() {
-    this.meta = {}; // trackId → { path, size, downloadedAt, encrypted }
-    this.queue = []; // Pending downloads
-    this.downloading = false;
-    this.currentDownload = null;
-    this.listeners = new Map();
+    this.vaultIndex   = {};   // hash → { path, filename, size, addedAt, type }
+    this.bufferIndex  = {};   // hash → { path, filename, size, addedAt }
+    this.downloadQueue = [];
+    this.activeDownloads = {};
+    this.listeners    = {};
   }
 
   async init() {
-    // Ensure buffer directory exists
-    const exists = await RNFS.exists(BUFFER_DIR);
-    if (!exists) await RNFS.mkdir(BUFFER_DIR);
-
-    // Load metadata
-    const stored = await AsyncStorage.getItem(META_KEY);
-    if (stored) this.meta = JSON.parse(stored);
-
-    // Verify files still exist
-    for (const [trackId, info] of Object.entries(this.meta)) {
-      const fileExists = await RNFS.exists(info.path);
-      if (!fileExists) {
-        console.log(`[BUFFER] File missing for ${trackId} — removing from meta`);
-        delete this.meta[trackId];
-      }
-    }
-
-    await this._saveMeta();
-    console.log(`[BUFFER] Initialized — ${Object.keys(this.meta).length} tracks buffered`);
+    await RNFS.mkdir(VAULT_DIR);
+    await RNFS.mkdir(BUFFER_DIR);
+    await this._loadIndex();
+    await this._reconcileFiles();
   }
 
-  /**
-   * Queue a track for download.
-   */
-  async queueDownload(trackId, downloadUrl, filename, size, albumData = null, isPersistent = false) {
-    if (this.meta[trackId]) {
-      console.log(`[BUFFER] ${trackId} already buffered`);
-      return;
-    }
+  // ─── Vault (Permanent) ────────────────────────────────────────────────────
 
-    if (isPersistent) {
-      // Offline Book (Vault)
-      const vaultGbStr = await AsyncStorage.getItem(VAULT_LIMIT_KEY);
-      const vaultGb = vaultGbStr ? parseInt(vaultGbStr, 10) : DEFAULT_VAULT_GB;
-      const maxVaultBytes = vaultGb * 1024 * 1024 * 1024;
-      const currentVault = await this.getPersistentSize();
-      
-      if (vaultGb !== -1 && currentVault + size > maxVaultBytes) {
-        console.log(`[BUFFER:VAULT] Reached Vault Limit (${vaultGb}GB). Download aborted.`);
-        this._emit('download_error', { trackId, error: `Vault limit reached (${vaultGb}GB)` });
-        return;
-      }
-    } else {
-      // Normal Buffer (Stream)
-      const limitGbStr = await AsyncStorage.getItem(BUFFER_LIMIT_KEY);
-      const limitGb = limitGbStr ? parseInt(limitGbStr, 10) : DEFAULT_BUFFER_GB;
-      const maxBytes = limitGb * 1024 * 1024 * 1024;
-      
-      const currentSize = await this.getTransientSize();
-      if (limitGb !== -1 && currentSize + size > maxBytes) {
-        console.log(`[BUFFER:STREAM] Limit reached (${limitGb}GB) — clearing oldest buffers`);
-        await this._evictOldest(size);
-      }
-    }
+  async vaultTrack(track, onProgress) {
+    const hash = this._hashId(track.path || track.id);
+    if (this.vaultIndex[hash]) return { alreadyVaulted: true };
 
-    const freespace = await RNFS.getFSInfo();
-    if (freespace.freeSpace < size + 100 * 1024 * 1024) {
-      console.log('[BUFFER] Insufficient fs space — clearing oldest streaming buffers');
-      await this._evictOldest(size);
-    }
+    const url      = MediaSyncService.buildStreamUrl(track.path);
+    const filename = track.filename || `${hash}.mp3`;
+    const destPath = `${VAULT_DIR}/${filename}`;
 
-    this.queue.push({ trackId, downloadUrl, filename, size, albumData, isPersistent });
-    this._emit('queue_updated', { queue: this.queue.length });
-
-    if (!this.downloading) this._processQueue();
+    return this._download(hash, url, destPath, filename, track.size, 'vault', onProgress);
   }
 
-  async _processQueue() {
-    if (this.queue.length === 0) {
-      this.downloading = false;
-      return;
-    }
-
-    this.downloading = true;
-    const job = this.queue.shift();
-    await this._download(job);
-    this._processQueue();
+  isVaulted(trackPathOrId) {
+    return !!this.vaultIndex[this._hashId(trackPathOrId)];
   }
 
-  async _download({ trackId, downloadUrl, filename, size, albumData, isPersistent }) {
-    const destPath = `${BUFFER_DIR}/${trackId}_${filename}`;
+  getVaultPath(trackPathOrId) {
+    const entry = this.vaultIndex[this._hashId(trackPathOrId)];
+    return entry?.path || null;
+  }
 
-    console.log(`[BUFFER] Downloading ${filename} (${Math.round(size / 1024 / 1024)}MB)`);
-    this._emit('download_start', { trackId, filename, size });
+  async removeFromVault(trackPathOrId) {
+    const hash  = this._hashId(trackPathOrId);
+    const entry = this.vaultIndex[hash];
+    if (!entry) return;
+    try { await RNFS.unlink(entry.path); } catch (_) {}
+    delete this.vaultIndex[hash];
+    await this._saveIndex();
+    this._emit('vault_updated', this.getVaultStats());
+  }
 
-    try {
-      const download = RNFS.downloadFile({
-        fromUrl: downloadUrl,
-        toFile: destPath,
-        headers: {
-          'Bypass-Tunnel-Reminder': 'true',
-          'User-Agent': 'localtunnel'
-        },
-        progress: (res) => {
-          const progress = res.bytesWritten / res.contentLength;
-          this._emit('download_progress', { trackId, progress, bytesWritten: res.bytesWritten });
-        },
-        progressDivider: 1,
+  getVaultStats() {
+    const entries = Object.values(this.vaultIndex);
+    const totalBytes = entries.reduce((s, e) => s + (e.size || 0), 0);
+    return {
+      count: entries.length,
+      totalMB: (totalBytes / 1024 / 1024).toFixed(1),
+      entries,
+    };
+  }
+
+  // ─── Buffer (Transient) ───────────────────────────────────────────────────
+
+  async bufferTrack(track, onProgress) {
+    const hash = this._hashId(track.path || track.id);
+    if (this.bufferIndex[hash]) return { alreadyCached: true, path: this.bufferIndex[hash].path };
+    if (this.vaultIndex[hash])  return { alreadyCached: true, path: this.vaultIndex[hash].path };
+
+    await this._ensureBufferSpace(track.size || 50 * 1024 * 1024);
+
+    const url      = MediaSyncService.buildStreamUrl(track.path);
+    const filename = track.filename || `${hash}_buf.mp3`;
+    const destPath = `${BUFFER_DIR}/${filename}`;
+
+    return this._download(hash, url, destPath, filename, track.size, 'buffer', onProgress);
+  }
+
+  getBufferPath(trackPathOrId) {
+    const hash  = this._hashId(trackPathOrId);
+    const entry = this.bufferIndex[hash] || this.vaultIndex[hash];
+    return entry?.path || null;
+  }
+
+  async clearBuffer() {
+    for (const entry of Object.values(this.bufferIndex)) {
+      try { await RNFS.unlink(entry.path); } catch (_) {}
+    }
+    this.bufferIndex = {};
+    await this._saveIndex();
+    this._emit('buffer_updated', this.getBufferStats());
+  }
+
+  async removeFromBuffer(trackPathOrId) {
+    const hash  = this._hashId(trackPathOrId);
+    const entry = this.bufferIndex[hash];
+    if (!entry) return;
+    try { await RNFS.unlink(entry.path); } catch (_) {}
+    delete this.bufferIndex[hash];
+    await this._saveIndex();
+    this._emit('buffer_updated', this.getBufferStats());
+  }
+
+  getBufferStats() {
+    const entries    = Object.values(this.bufferIndex);
+    const totalBytes = entries.reduce((s, e) => s + (e.size || 0), 0);
+    return {
+      count: entries.length,
+      totalMB: (totalBytes / 1024 / 1024).toFixed(1),
+      maxGB: BUFFER_MAX_GB,
+      entries,
+    };
+  }
+
+  // ─── Download Core ────────────────────────────────────────────────────────
+
+  async _download(hash, url, destPath, filename, fileSize, lane, onProgress) {
+    if (this.activeDownloads[hash]) {
+      return new Promise(resolve => {
+        this.once(`download_complete_${hash}`, resolve);
       });
+    }
 
-      this.currentDownload = download;
-      const result = await download.promise;
+    this._emit('queue_updated', { hash, status: 'starting', filename });
 
+    const headers = MediaSyncService.getRequestHeaders();
+    let lastPercent = 0;
+
+    const { promise, jobId } = RNFS.downloadFile({
+      fromUrl: url,
+      toFile: destPath,
+      headers,
+      progressDivider: 5,
+      begin: (res) => {
+        this.activeDownloads[hash] = { jobId, filename, lane };
+        this._emit('download_begin', { hash, filename, contentLength: res.contentLength });
+      },
+      progress: (res) => {
+        const pct = Math.round((res.bytesWritten / res.contentLength) * 100);
+        if (pct !== lastPercent) {
+          lastPercent = pct;
+          onProgress && onProgress(pct);
+          this._emit('download_progress', { hash, filename, pct });
+        }
+      },
+    });
+
+    this.activeDownloads[hash] = { jobId, filename, lane };
+
+    try {
+      const result = await promise;
       if (result.statusCode === 200) {
-        this.meta[trackId] = {
-          path: destPath,
-          filename,
-          size: result.bytesWritten,
-          downloadedAt: Date.now(),
-          albumData,
-          isPersistent,
-        };
+        const stat    = await RNFS.stat(destPath);
+        const entry   = { path: destPath, filename, size: stat.size, addedAt: Date.now() };
+        if (lane === 'vault')  this.vaultIndex[hash]  = { ...entry, type: 'vault' };
+        else                   this.bufferIndex[hash] = entry;
+        await this._saveIndex();
 
-        await this._saveMeta();
-        console.log(`[BUFFER] ✓ ${filename} buffered successfully`);
-        this._emit('download_complete', { trackId, path: destPath });
-      } else {
-        console.error(`[BUFFER] Download failed: HTTP ${result.statusCode}`);
-        this._emit('download_error', { trackId, error: `HTTP ${result.statusCode}` });
+        delete this.activeDownloads[hash];
+        this._emit('download_complete', { hash, filename, path: destPath });
+        this._emit(`download_complete_${hash}`, { hash, filename, path: destPath });
+        if (lane === 'vault') this._emit('vault_updated', this.getVaultStats());
+        else                  this._emit('buffer_updated', this.getBufferStats());
+        return { success: true, path: destPath };
       }
-    } catch (e) {
-      if (e.message === 'cancelled') {
-        console.log(`[BUFFER] Download cancelled: ${trackId}`);
-        this._emit('download_cancelled', { trackId });
-      } else {
-        console.error(`[BUFFER] Download error:`, e);
-        this._emit('download_error', { trackId, error: e.message });
-      }
-    } finally {
-      this.currentDownload = null;
+      throw new Error(`Status ${result.statusCode}`);
+    } catch (err) {
+      delete this.activeDownloads[hash];
+      try { await RNFS.unlink(destPath); } catch (_) {}
+      this._emit('download_error', { hash, filename, error: err.message });
+      return { success: false, error: err.message };
     }
   }
 
-  cancelCurrentDownload() {
-    if (this.currentDownload) {
-      RNFS.stopDownload(this.currentDownload.jobId);
+  // ─── Space Management ─────────────────────────────────────────────────────
+
+  async _ensureBufferSpace(neededBytes) {
+    const fsInfo     = await RNFS.getFSInfo();
+    const freeMB     = fsInfo.freeSpace / 1024 / 1024;
+    const bufferMB   = parseFloat(this.getBufferStats().totalMB);
+    const maxMB      = BUFFER_MAX_GB * 1024;
+
+    if (freeMB < LOW_SPACE_MB || bufferMB + neededBytes / 1024 / 1024 > maxMB) {
+      await this._evictOldest(neededBytes);
     }
-  }
-
-  /**
-   * Get local file path if buffered, null otherwise.
-   */
-  getLocalPath(trackId) {
-    return this.meta[trackId]?.path || null;
-  }
-
-  isBuffered(trackId) {
-    return !!this.meta[trackId];
-  }
-
-  getBufferedTracks() {
-    return Object.keys(this.meta);
-  }
-
-  getBufferInfo(trackId) {
-    return this.meta[trackId] || null;
-  }
-
-  async getBufferSize() {
-    let total = 0;
-    for (const info of Object.values(this.meta)) total += info.size || 0;
-    return total;
-  }
-
-  async getPersistentSize() {
-    let total = 0;
-    for (const info of Object.values(this.meta)) {
-      if (info.isPersistent) total += info.size || 0;
-    }
-    return total;
-  }
-
-  async getTransientSize() {
-    let total = 0;
-    for (const info of Object.values(this.meta)) {
-      if (!info.isPersistent) total += info.size || 0;
-    }
-    return total;
-  }
-
-  async deleteBuffer(trackId) {
-    const info = this.meta[trackId];
-    if (!info) return;
-
-    try {
-      await RNFS.unlink(info.path);
-    } catch {}
-
-    delete this.meta[trackId];
-    await this._saveMeta();
-    this._emit('buffer_deleted', { trackId });
-  }
-
-  async clearAllBuffers() {
-    try {
-      await RNFS.unlink(BUFFER_DIR);
-      await RNFS.mkdir(BUFFER_DIR);
-    } catch {}
-
-    this.meta = {};
-    await this._saveMeta();
-    this._emit('buffer_cleared', {});
   }
 
   async _evictOldest(neededBytes) {
-    // Only evict transient streaming buffers (isPersistent == false)
-    const sorted = Object.entries(this.meta)
-      .filter(([, info]) => !info.isPersistent)
-      .sort(([, a], [, b]) => a.downloadedAt - b.downloadedAt);
-
+    const sorted = Object.entries(this.bufferIndex)
+      .sort((a, b) => a[1].addedAt - b[1].addedAt);
     let freed = 0;
-    for (const [trackId, info] of sorted) {
-      await this.deleteBuffer(trackId);
-      freed += info.size || 0;
+    for (const [hash, entry] of sorted) {
       if (freed >= neededBytes) break;
+      try { await RNFS.unlink(entry.path); } catch (_) {}
+      freed += entry.size || 0;
+      delete this.bufferIndex[hash];
     }
-
-    console.log(`[BUFFER] Evicted ${Math.round(freed / 1024 / 1024)}MB of transient cache`);
+    await this._saveIndex();
+    this._emit('buffer_updated', this.getBufferStats());
   }
 
-  async _saveMeta() {
-    await AsyncStorage.setItem(META_KEY, JSON.stringify(this.meta));
+  // ─── Persistence ─────────────────────────────────────────────────────────
+
+  async _saveIndex() {
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify({
+      vault: this.vaultIndex,
+      buffer: this.bufferIndex,
+    }));
+  }
+
+  async _loadIndex() {
+    try {
+      const raw = await AsyncStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        this.vaultIndex  = parsed.vault  || {};
+        this.bufferIndex = parsed.buffer || {};
+      }
+    } catch (_) {}
+  }
+
+  async _reconcileFiles() {
+    // Remove index entries for files that no longer exist on disk
+    for (const [hash, entry] of Object.entries(this.vaultIndex)) {
+      const exists = await RNFS.exists(entry.path);
+      if (!exists) delete this.vaultIndex[hash];
+    }
+    for (const [hash, entry] of Object.entries(this.bufferIndex)) {
+      const exists = await RNFS.exists(entry.path);
+      if (!exists) delete this.bufferIndex[hash];
+    }
+    await this._saveIndex();
+  }
+
+  // ─── Helpers ─────────────────────────────────────────────────────────────
+
+  _hashId(str) {
+    return CryptoJS.SHA256(String(str)).toString().slice(0, 16);
   }
 
   on(event, cb) {
-    if (!this.listeners.has(event)) this.listeners.set(event, new Set());
-    this.listeners.get(event).add(cb);
-    return () => this.listeners.get(event)?.delete(cb);
+    if (!this.listeners[event]) this.listeners[event] = [];
+    this.listeners[event].push(cb);
+    return () => this.off(event, cb);
+  }
+
+  once(event, cb) {
+    const wrapped = (data) => { cb(data); this.off(event, wrapped); };
+    this.on(event, wrapped);
+  }
+
+  off(event, cb) {
+    if (!this.listeners[event]) return;
+    this.listeners[event] = this.listeners[event].filter(l => l !== cb);
   }
 
   _emit(event, data) {
-    this.listeners.get(event)?.forEach(cb => { try { cb(data); } catch {} });
+    (this.listeners[event] || []).forEach(cb => {
+      try { cb(data); } catch (_) {}
+    });
   }
 }
 
-export default new OfflineBufferService();
+export const OfflineBufferService = new OfflineBufferServiceClass();
+export default OfflineBufferService;

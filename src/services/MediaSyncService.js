@@ -1,253 +1,283 @@
+/**
+ * MediaSyncService.js
+ * Central nervous system — connects to PC daemon, fetches library manifest,
+ * manages WebSocket, handles reconnection, caches manifest to AsyncStorage.
+ */
+
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 
-const SYNC_PORT = 5002;
-const HEARTBEAT_INTERVAL = 10000;
-const HEARTBEAT_MISS_LIMIT = 5; // Tolerates up to 50s of LocalTunnel proxy jitter
-const CONN_KEY = 'omega_media_host';
+const STORAGE_KEY_HOST       = '@sovereign_host';
+const STORAGE_KEY_MANIFEST   = '@sovereign_manifest_cache';
+const STORAGE_KEY_LAN        = '@sovereign_lan_ip';
 
-class MediaSyncService {
+const PING_INTERVAL_MS       = 8000;
+const PONG_TIMEOUT_MS        = 12000;
+const RECONNECT_BASE_MS      = 2000;
+const RECONNECT_MAX_MS       = 30000;
+const BYPASS_HEADER          = 'Bypass-Tunnel-Reminder';
+
+class MediaSyncServiceClass {
   constructor() {
-    this.connected = false;
-    this.mode = 'offline';
-    this.listeners = new Map();
-    this.heartbeatTimer = null;
-    this.heartbeatMisses = 0;
+    this.host           = null;
+    this.lanIp          = null;
+    this.ws             = null;
+    this.isConnected    = false;
+    this.manifest       = null;
+    this.listeners      = {};
+    this.pingTimer      = null;
+    this.pongTimer      = null;
     this.reconnectTimer = null;
-    this.reconnectAttempts = 0;
-    this.host = null;
-    this.onNetworkChange = null;
+    this.reconnectDelay = RECONNECT_BASE_MS;
+    this.destroyed      = false;
+    this._pendingQueue  = [];
   }
 
-  async init(host) {
-    if (host) {
-      this.host = host.replace(/^(https?:\/\/|wss?:\/\/)/, '').replace(/\/.*$/, '');
-      await AsyncStorage.setItem(CONN_KEY, this.host);
-      // Also save to settings screen key to keep them synced
-      await AsyncStorage.setItem('@omega_host_ip', this.host);
-    } else {
-      const saved = await AsyncStorage.getItem(CONN_KEY) || await AsyncStorage.getItem('@omega_host_ip');
-      this.host = saved ? saved.replace(/^(https?:\/\/|wss?:\/\/)/, '').replace(/\/.*$/, '') : null;
+  // ─── Initialization ───────────────────────────────────────────────────────
+
+  async init() {
+    this.host  = await AsyncStorage.getItem(STORAGE_KEY_HOST);
+    this.lanIp = await AsyncStorage.getItem(STORAGE_KEY_LAN);
+    if (this.host || this.lanIp) {
+      await this._fetchManifest();
+      this._connectWebSocket();
     }
+    this._monitorNetwork();
+  }
 
-    if (this.onNetworkChange) {
-      this.onNetworkChange();
-      this.onNetworkChange = null;
-    }
+  async setHost(url) {
+    const clean = url.trim().replace(/\/$/, '');
+    this.host = clean;
+    await AsyncStorage.setItem(STORAGE_KEY_HOST, clean);
+    await this._fetchManifest();
+    this._connectWebSocket();
+  }
 
-    this.onNetworkChange = NetInfo.addEventListener(state => {
-      const isAvailable = state.isConnected !== false;
-      if (isAvailable && !this.connected && this.host) {
-        this._connect();
-      }
-    });
+  async setLanIp(ip) {
+    this.lanIp = ip;
+    await AsyncStorage.setItem(STORAGE_KEY_LAN, ip);
+  }
 
-    if (this.host) {
-      this._connect();
-    } else {
-      this._setMode('offline');
+  getBaseUrl() {
+    return this.host || (this.lanIp ? `http://${this.lanIp}:5002` : null);
+  }
+
+  // ─── Manifest Fetch ───────────────────────────────────────────────────────
+
+  async _fetchManifest() {
+    const base = this.getBaseUrl();
+    if (!base) return null;
+    try {
+      const res = await fetch(`${base}/library`, {
+        headers: {
+          [BYPASS_HEADER]: 'true',
+          'Accept': 'application/json',
+        },
+        timeout: 10000,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      this.manifest = data;
+      await AsyncStorage.setItem(STORAGE_KEY_MANIFEST, JSON.stringify(data));
+      this._emit('manifest', data);
+      return data;
+    } catch (err) {
+      console.warn('[MediaSync] Manifest fetch failed, loading cache:', err.message);
+      return await this._loadCachedManifest();
     }
   }
 
-  _connect() {
-    this.connected = false;
-    if (!this.host) return;
-
-    console.log(`[MEDIA_SYNC] Initializing HTTP Sync Polling to ${this.host}`);
-    this.connected = true;
-    this._setMode('online');
-
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    
-    this._startHeartbeat();
-  }
-
-  getHttpUrl(path = '') {
-    if (!this.host) return null;
-    if (this.host.includes('.loca.lt') || this.host.includes('.ngrok')) {
-      return `https://${this.host}${path}`;
-    }
-    return `http://${this.host}:${SYNC_PORT}${path}`;
-  }
-
-  async fetchLibrary(retries = 3) {
-    const url = this.getHttpUrl('/library');
-    if (!url) {
-      this._emit('LIBRARY_ERROR', 'No Desktop Sync IP Configured.');
-      return false;
-    }
-    
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 15000);
-
-        const res = await fetch(url, { 
-          headers: { 
-            'Bypass-Tunnel-Reminder': 'true',
-            'User-Agent': 'localtunnel'
-          },
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        
-        // Success reset
-        this.heartbeatMisses = 0;
-        this._setMode('online');
-        
-        this._emit('LIBRARY_RESPONSE', data);
+  async _loadCachedManifest() {
+    try {
+      const cached = await AsyncStorage.getItem(STORAGE_KEY_MANIFEST);
+      if (cached) {
+        const data = JSON.parse(cached);
+        this.manifest = data;
+        this._emit('manifest', data);
         return data;
-      } catch (e) {
-        if (attempt === retries) {
-          console.warn('[MEDIA_SYNC] fetchLibrary failed after retries:', e);
-          this._emit('LIBRARY_ERROR', `Fetch Error: ${e.message} (${url})`);
-          return false;
-        }
-        await new Promise(r => setTimeout(r, attempt * 1000));
       }
-    }
+    } catch (_) {}
+    return null;
   }
 
-  _startHeartbeat() {
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    this.heartbeatMisses = 0;
-    
-    const sendPing = async () => {
-      if (!this.connected) return;
-      const url = this.getHttpUrl('/api/sync');
-      if (!url) return;
+  async refreshManifest() {
+    return await this._fetchManifest();
+  }
 
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 8000);
+  getManifest() {
+    return this.manifest;
+  }
 
-        const payload = { type: 'HEARTBEAT', ts: Date.now() };
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Bypass-Tunnel-Reminder': 'true',
-            'User-Agent': 'localtunnel'
-          },
-          body: JSON.stringify(payload),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-        
-        if (res.ok) {
-          this.heartbeatMisses = 0;
-          if (this.mode !== 'online') this._setMode('online');
-        } else {
-          throw new Error('HTTP ' + res.status);
-        }
-      } catch (e) {
-        this.heartbeatMisses++;
-        if (this.heartbeatMisses >= HEARTBEAT_MISS_LIMIT) {
-          console.warn('[MEDIA_SYNC] Heartbeat missed limit. Going offline.');
-          this.connected = false;
-          this._setMode('offline');
-          this._scheduleReconnect();
-        }
-      }
-    };
+  // ─── WebSocket ────────────────────────────────────────────────────────────
 
-    sendPing();
-    this.heartbeatTimer = setInterval(sendPing, HEARTBEAT_INTERVAL);
+  _connectWebSocket() {
+    if (this.ws) {
+      try { this.ws.close(); } catch (_) {}
+      this.ws = null;
+    }
+    const base = this.getBaseUrl();
+    if (!base) return;
+
+    const wsUrl = base
+      .replace(/^https:\/\//, 'wss://')
+      .replace(/^http:\/\//, 'ws://')
+      + '/ws';
+
+    try {
+      this.ws = new WebSocket(wsUrl, null, {
+        headers: { [BYPASS_HEADER]: 'true' },
+      });
+
+      this.ws.onopen = () => {
+        this.isConnected    = true;
+        this.reconnectDelay = RECONNECT_BASE_MS;
+        this._emit('connected', true);
+        this._startPing();
+        this._flushQueue();
+      };
+
+      this.ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'PONG') {
+            clearTimeout(this.pongTimer);
+          } else {
+            this._emit('message', msg);
+            this._emit(msg.type, msg.payload);
+          }
+        } catch (_) {}
+      };
+
+      this.ws.onerror = (err) => {
+        console.warn('[MediaSync] WS error:', err.message);
+      };
+
+      this.ws.onclose = () => {
+        this.isConnected = false;
+        this._emit('connected', false);
+        this._stopPing();
+        if (!this.destroyed) this._scheduleReconnect();
+      };
+    } catch (err) {
+      console.warn('[MediaSync] WS connect failed:', err.message);
+      this._scheduleReconnect();
+    }
   }
 
   _scheduleReconnect() {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    
-    const delay = Math.min(3000 * Math.pow(1.5, this.reconnectAttempts), 30000);
+    clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
-      if (this.host) {
-        this.reconnectAttempts++;
-        this._connect();
-      }
-    }, delay);
+      this.reconnectDelay = Math.min(this.reconnectDelay * 1.5, RECONNECT_MAX_MS);
+      this._connectWebSocket();
+    }, this.reconnectDelay);
   }
 
-  _setMode(mode) {
-    if (this.mode !== mode) {
-      this.mode = mode;
-      this._emit('mode_change', { mode });
-      console.log(`[MEDIA_SYNC] Mode: ${mode.toUpperCase()}`);
+  _startPing() {
+    this.pingTimer = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'PING' }));
+        this.pongTimer = setTimeout(() => {
+          console.warn('[MediaSync] PONG timeout, reconnecting');
+          this.ws?.close();
+        }, PONG_TIMEOUT_MS);
+      }
+    }, PING_INTERVAL_MS);
+  }
+
+  _stopPing() {
+    clearInterval(this.pingTimer);
+    clearTimeout(this.pongTimer);
+  }
+
+  send(msg) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    } else {
+      if (this._pendingQueue.length < 50) {
+        this._pendingQueue.push(msg);
+      }
     }
   }
 
-  async sendPlayheadUpdate(trackId, positionMs, isPaused) {
-    if (!this.connected || !this.host) return;
-    const url = this.getHttpUrl('/api/sync');
-    if (!url) return;
-
-    try {
-      await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Bypass-Tunnel-Reminder': 'true',
-          'User-Agent': 'localtunnel'
-        },
-        body: JSON.stringify({
-          type: 'PLAYHEAD_UPDATE',
-          track_id: trackId,
-          position_ms: positionMs,
-          is_paused: isPaused
-        })
-      });
-    } catch (e) {}
+  _flushQueue() {
+    while (this._pendingQueue.length > 0) {
+      const msg = this._pendingQueue.shift();
+      this.ws?.send(JSON.stringify(msg));
+    }
   }
 
-  async send(type, data = {}) {
-    if (!this.connected || !this.host) return;
-    const url = this.getHttpUrl('/api/sync');
-    if (!url) return;
+  // ─── Playhead Sync ────────────────────────────────────────────────────────
 
+  async postPlayhead(trackId, positionMs, type = 'audio') {
+    const base = this.getBaseUrl();
+    if (!base) return;
     try {
-      const res = await fetch(url, {
+      await fetch(`${base}/api/sync`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Bypass-Tunnel-Reminder': 'true',
-          'User-Agent': 'localtunnel'
+          [BYPASS_HEADER]: 'true',
         },
-        body: JSON.stringify({ type, ...data })
+        body: JSON.stringify({ track_id: trackId, position_ms: positionMs, type }),
       });
-      const responseBody = await res.json();
-      if (responseBody && responseBody.type) {
-        this._emit(responseBody.type, responseBody);
+    } catch (_) {}
+  }
+
+  // ─── Stream URL Builder ───────────────────────────────────────────────────
+
+  buildStreamUrl(path) {
+    const base = this.getBaseUrl();
+    if (!base) return null;
+    return `${base}/stream_media?path=${encodeURIComponent(path)}`;
+  }
+
+  buildCoverUrl(hash) {
+    const base = this.getBaseUrl();
+    if (!base) return null;
+    return `${base}/cover/${hash}.jpg`;
+  }
+
+  getRequestHeaders() {
+    return { [BYPASS_HEADER]: 'true' };
+  }
+
+  // ─── Network Monitor ─────────────────────────────────────────────────────
+
+  _monitorNetwork() {
+    NetInfo.addEventListener(state => {
+      if (state.isConnected && !this.isConnected) {
+        this._fetchManifest();
+        this._connectWebSocket();
       }
-    } catch (e) {}
-  }
-
-  pushPosition(trackId, positionMs, isPaused) {
-    return this.send('PLAYHEAD_UPDATE', { track_id: trackId, position_ms: positionMs, is_paused: isPaused });
-  }
-
-  on(event, cb) {
-    if (!this.listeners.has(event)) this.listeners.set(event, new Set());
-    this.listeners.get(event).add(cb);
-    return () => this.listeners.get(event)?.delete(cb);
-  }
-
-  _emit(event, data) {
-    this.listeners.get(event)?.forEach(cb => {
-      try { cb(data); } catch (e) {}
     });
   }
 
-  getMode() { return this.mode; }
-  isConnected() { return this.connected; }
+  // ─── Event Bus ───────────────────────────────────────────────────────────
+
+  on(event, cb) {
+    if (!this.listeners[event]) this.listeners[event] = [];
+    this.listeners[event].push(cb);
+    return () => this.off(event, cb);
+  }
+
+  off(event, cb) {
+    if (!this.listeners[event]) return;
+    this.listeners[event] = this.listeners[event].filter(l => l !== cb);
+  }
+
+  _emit(event, data) {
+    (this.listeners[event] || []).forEach(cb => {
+      try { cb(data); } catch (_) {}
+    });
+  }
 
   destroy() {
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.destroyed = true;
+    this._stopPing();
     clearTimeout(this.reconnectTimer);
-    if (this.onNetworkChange) this.onNetworkChange();
+    try { this.ws?.close(); } catch (_) {}
   }
 }
 
-export default new MediaSyncService();
+export const MediaSyncService = new MediaSyncServiceClass();
+export default MediaSyncService;

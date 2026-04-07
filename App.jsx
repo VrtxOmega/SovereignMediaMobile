@@ -1,194 +1,134 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, StatusBar, StyleSheet, AppState, ActivityIndicator } from 'react-native';
-import { NavigationContainer as NavContainer } from '@react-navigation/native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { createStackNavigator } from '@react-navigation/stack';
-import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { GestureHandlerRootView } from 'react-native-gesture-handler';
+/**
+ * App.jsx — Root. Initializes services, handles IP config gate,
+ * renders BottomTabNavigator + NowPlaying overlay.
+ */
 
-import { colors, spacing } from './src/theme/veritas';
-import { setupPlayer } from './src/services/PlayerService';
+import React, { useEffect, useState, useCallback } from 'react';
+import {
+  View,
+  StyleSheet,
+  StatusBar,
+  LogBox,
+} from 'react-native';
+import { NavigationContainer } from '@react-navigation/native';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+import { COLORS } from './src/theme/veritas';
+import BottomTabNavigator from './src/navigation/BottomTabNavigator';
+import IPConfigScreen from './src/screens/IPConfigScreen';
+import NowPlayingScreen from './src/screens/NowPlayingScreen';
+import SovereignPlayer from './src/components/SovereignPlayer';
+
 import MediaSyncService from './src/services/MediaSyncService';
 import OfflineBufferService from './src/services/OfflineBufferService';
 import StateLedgerService from './src/services/StateLedgerService';
+import PlayerService from './src/services/PlayerService';
 
-import LibraryScreen from './src/screens/LibraryScreen';
-import BooksScreen from './src/screens/BooksScreen';
-import VideoScreen from './src/screens/VideoScreen';
-import NowPlayingScreen from './src/screens/NowPlayingScreen';
-import IPConfigScreen from './src/screens/IPConfigScreen';
-import SettingsScreen from './src/screens/SettingsScreen';
-import AlbumScreen from './src/screens/AlbumScreen';
-
-const Tab = createBottomTabNavigator();
-const Stack = createStackNavigator();
-
-const TabIcon = ({ label, focused }) => {
-  const icons = { Audio: '♫', Books: '📖', Video: '▶', System: '⚙' };
-  return (
-    <View style={tabStyles.wrapper}>
-      <Text style={[tabStyles.icon, { color: focused ? colors.gold : colors.goldDim }]}>
-        {icons[label] || '●'}
-      </Text>
-      <Text style={[tabStyles.label, { color: focused ? colors.gold : colors.goldDim }]}>
-        {label.toUpperCase()}
-      </Text>
-    </View>
-  );
-};
-
-const tabStyles = StyleSheet.create({
-  wrapper: { alignItems: 'center' },
-  icon: { fontSize: 18 },
-  label: { fontFamily: 'Courier New', fontSize: 7, letterSpacing: 1, marginTop: 2 },
-});
-
-function MainTabs() {
-  return (
-    <Tab.Navigator
-      screenOptions={{
-        headerShown: false,
-        headerStyle: {
-          backgroundColor: colors.obsidianLight,
-          borderBottomWidth: 1,
-          borderBottomColor: colors.border,
-        },
-        headerTintColor: colors.gold,
-        headerTitleStyle: { fontFamily: 'Courier New', fontSize: 11, letterSpacing: 3 },
-        tabBarStyle: {
-          backgroundColor: colors.obsidianLight,
-          borderTopWidth: 1,
-          borderTopColor: colors.border,
-          height: 72,
-          paddingTop: 8,
-          paddingBottom: 8,
-        },
-        tabBarShowLabel: false,
-      }}
-    >
-      <Tab.Screen
-        name="Library"
-        component={LibraryScreen}
-        options={{
-          title: 'AUDIO',
-          tabBarIcon: ({ focused }) => <TabIcon label="Audio" focused={focused} />,
-        }}
-      />
-      <Tab.Screen
-        name="Books"
-        component={BooksScreen}
-        options={{
-          title: 'EBOOKS',
-          tabBarIcon: ({ focused }) => <TabIcon label="Books" focused={focused} />,
-        }}
-      />
-      <Tab.Screen
-        name="Video"
-        component={VideoScreen}
-        options={{
-          title: 'MOVIES',
-          tabBarIcon: ({ focused }) => <TabIcon label="Video" focused={focused} />,
-        }}
-      />
-      <Tab.Screen
-        name="Settings"
-        component={SettingsScreen}
-        options={{
-          title: 'SYSTEM',
-          tabBarIcon: ({ focused }) => <TabIcon label="System" focused={focused} />,
-        }}
-      />
-    </Tab.Navigator>
-  );
-}
+LogBox.ignoreLogs([
+  'Non-serializable values were found in the navigation state',
+  'Require cycle:',
+]);
 
 export default function App() {
-  const [initialRoute, setInitialRoute] = useState(null);
+  const [ready,          setReady]          = useState(false);
+  const [hasHost,        setHasHost]        = useState(false);
+  const [nowPlayingOpen, setNowPlayingOpen] = useState(false);
+  const [currentTrack,   setCurrentTrack]   = useState(null);
 
   useEffect(() => {
-    const init = async () => {
-      try {
-        await setupPlayer();
-        await OfflineBufferService.init();
-        await StateLedgerService.init();
-
-        const host = await AsyncStorage.getItem('omega_media_host');
-        if (host) {
-          await MediaSyncService.init(host);
-          setInitialRoute('Main');
-        } else {
-          setInitialRoute('IPConfig');
-        }
-        console.log('[APP] Sovereign Media initialized');
-      } catch (err) {
-        console.error('[APP] Initialization failed:', err);
-        setInitialRoute('IPConfig');
-      }
-    };
-
-    init();
-
-    const sub = AppState.addEventListener('change', async (state) => {
-      if (state === 'background' || state === 'inactive') {
-        try {
-          const { getPosition } = await import('./src/services/PlayerService');
-          const pos = await getPosition();
-          StateLedgerService.updatePosition(Math.round(pos * 1000), true);
-        } catch (e) {
-           console.log("Error pushing position on background", e);
-        }
-      }
-    });
-
+    bootstrap();
     return () => {
-      sub.remove();
-      StateLedgerService.destroy();
       MediaSyncService.destroy();
+      StateLedgerService.destroy();
     };
   }, []);
 
-  if (!initialRoute) {
+  const bootstrap = async () => {
+    try {
+      await PlayerService.setup();
+      await OfflineBufferService.init();
+      await StateLedgerService.init();
+      await MediaSyncService.init();
+
+      const host = await AsyncStorage.getItem('@sovereign_host');
+      setHasHost(!!host);
+    } catch (err) {
+      console.warn('[App] Bootstrap error:', err);
+    } finally {
+      setReady(true);
+    }
+  };
+
+  const handleHostSaved = useCallback(() => {
+    setHasHost(true);
+  }, []);
+
+  const openNowPlaying = useCallback((track) => {
+    setCurrentTrack(track);
+    setNowPlayingOpen(true);
+  }, []);
+
+  const closeNowPlaying = useCallback(() => {
+    setNowPlayingOpen(false);
+  }, []);
+
+  if (!ready) return (
+    <View style={styles.splash}>
+      <StatusBar barStyle="light-content" backgroundColor={COLORS.obsidianDeep} />
+    </View>
+  );
+
+  if (!hasHost) {
     return (
-      <View style={{ flex: 1, backgroundColor: colors.obsidian, justifyContent: 'center', alignItems: 'center' }}>
-        <ActivityIndicator size="large" color={colors.gold} />
-      </View>
+      <SafeAreaProvider>
+        <StatusBar barStyle="light-content" backgroundColor={COLORS.obsidianDeep} />
+        <IPConfigScreen onSaved={handleHostSaved} />
+      </SafeAreaProvider>
     );
   }
 
   return (
-    <GestureHandlerRootView style={{ flex: 1 }}>
-      <SafeAreaProvider>
-        <StatusBar barStyle="light-content" backgroundColor={colors.obsidian} />
-        <NavContainer
-          theme={{
-            dark: true,
-            colors: {
-              primary: colors.gold,
-              background: colors.obsidian,
-              card: colors.obsidianLight,
-              text: colors.text,
-              border: colors.border,
-              notification: colors.red,
-            }
-          }}
-        >
-          <Stack.Navigator screenOptions={{ headerShown: false }} initialRouteName={initialRoute}>
-            <Stack.Screen name="IPConfig" component={IPConfigScreen} />
-            <Stack.Screen name="Main" component={MainTabs} />
-            <Stack.Screen name="Album" component={AlbumScreen} />
-            <Stack.Screen
-              name="NowPlaying"
-              component={NowPlayingScreen}
-              options={{
-                headerShown: false,
-                presentation: 'modal',
-                gestureEnabled: true,
-              }}
-            />
-          </Stack.Navigator>
-        </NavContainer>
-      </SafeAreaProvider>
-    </GestureHandlerRootView>
+    <SafeAreaProvider>
+      <StatusBar barStyle="light-content" backgroundColor={COLORS.obsidianDeep} />
+      <NavigationContainer
+        theme={{
+          dark: true,
+          colors: {
+            primary:      COLORS.gold,
+            background:   COLORS.obsidian,
+            card:         COLORS.obsidianCard,
+            text:         COLORS.textPrimary,
+            border:       COLORS.obsidianBorder,
+            notification: COLORS.gold,
+          },
+        }}
+      >
+        <View style={styles.root}>
+          <BottomTabNavigator onTrackPress={openNowPlaying} />
+
+          {/* Mini player — always visible when media is active */}
+          <SovereignPlayer onExpand={openNowPlaying} />
+
+          {/* Full-screen now playing overlay */}
+          <NowPlayingScreen
+            visible={nowPlayingOpen}
+            track={currentTrack}
+            onClose={closeNowPlaying}
+          />
+        </View>
+      </NavigationContainer>
+    </SafeAreaProvider>
   );
 }
+
+const styles = StyleSheet.create({
+  splash: {
+    flex: 1,
+    backgroundColor: COLORS.obsidianDeep,
+  },
+  root: {
+    flex: 1,
+    backgroundColor: COLORS.obsidian,
+  },
+});

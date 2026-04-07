@@ -1,68 +1,76 @@
-export const colors = {
-  obsidian: '#0A0A0C',
-  obsidianLight: '#111118',
-  obsidianMid: '#13131a',
-  obsidianDeep: '#080809',
-  gold: '#D4AF37',
-  goldBright: '#E8C84A',
-  goldDim: 'rgba(212, 175, 55, 0.4)',
-  goldFaint: 'rgba(212, 175, 55, 0.12)',
-  goldGlow: 'rgba(212, 175, 55, 0.08)',
-  goldSelection: 'rgba(212, 175, 55, 0.2)',
-  text: '#c8c8b4',
-  textDim: 'rgba(200, 200, 180, 0.6)',
-  textFaint: 'rgba(200, 200, 180, 0.3)',
-  border: 'rgba(212, 175, 55, 0.18)',
-  borderBright: 'rgba(212, 175, 55, 0.35)',
-  green: '#4CAF50',
-  greenDim: 'rgba(76, 175, 80, 0.15)',
-  red: '#e74c3c',
-  orange: '#e67e22',
-  blue: '#3498db',
-  white: '#ffffff',
+// VERITAS Design System — Obsidian & Gold
+export const COLORS = {
+  obsidian:       '#0A0A0A',
+  obsidianDeep:   '#050505',
+  obsidianCard:   '#111111',
+  obsidianBorder: '#1A1A1A',
+  obsidianHover:  '#1C1C1C',
+
+  gold:           '#D4AF37',
+  goldBright:     '#F9E596',
+  goldDim:        '#9A7D1A',
+  goldGlow:       'rgba(212, 175, 55, 0.35)',
+  goldGlowStrong: 'rgba(212, 175, 55, 0.6)',
+
+  textPrimary:    '#F0EAD6',
+  textSecondary:  '#AAAAAA',
+  textDim:        '#666666',
+  textGold:       '#D4AF37',
+
+  success:        '#2ECC71',
+  error:          '#E74C3C',
+  warning:        '#F39C12',
+  info:           '#3498DB',
+
+  ephemeral:      '#4A90D9',
+  persistent:     '#D4AF37',
+
+  overlayDark:    'rgba(0,0,0,0.75)',
+  overlayMid:     'rgba(0,0,0,0.5)',
+  overlayLight:   'rgba(0,0,0,0.25)',
+  glassPanel:     'rgba(15,15,15,0.92)',
 };
 
-export const spacing = {
-  xs: 4, sm: 8, md: 12, lg: 16, xl: 24, xxl: 32, xxxl: 48,
+export const FONTS = {
+  mono:    'Courier New',
+  serif:   'Georgia',
+  system:  'System',
 };
 
-export const radius = {
-  sm: 6, md: 10, lg: 16, xl: 24, xxl: 32, pill: 999,
+export const SPACING = {
+  xs:  4,
+  sm:  8,
+  md:  16,
+  lg:  24,
+  xl:  32,
+  xxl: 48,
 };
 
-export const fonts = {
-  mono: 'Courier New',
-  sans: 'System',
+export const RADIUS = {
+  sm:  4,
+  md:  8,
+  lg:  12,
+  xl:  20,
+  full: 999,
 };
 
-export const typography = {
-  label: {
-    fontFamily: 'Courier New',
-    fontSize: 9,
-    letterSpacing: 2,
-    color: 'rgba(212, 175, 55, 0.4)',
-    textTransform: 'uppercase',
+export const SHADOWS = {
+  gold: {
+    shadowColor: '#D4AF37',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.4,
+    shadowRadius: 8,
+    elevation: 8,
   },
-  title: {
-    fontFamily: 'Courier New',
-    fontSize: 12,
-    letterSpacing: 4,
-    color: '#D4AF37',
-  },
-  body: {
-    fontFamily: 'System',
-    fontSize: 14,
-    color: '#c8c8b4',
-    lineHeight: 22,
-  },
-  bodySmall: {
-    fontFamily: 'Courier New',
-    fontSize: 10,
-    color: 'rgba(200, 200, 180, 0.6)',
-  },
-  mono: {
-    fontFamily: 'Courier New',
-    fontSize: 12,
-    color: '#c8c8b4',
+  card: {
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.5,
+    shadowRadius: 6,
+    elevation: 6,
   },
 };
+
+export const TAB_BAR_HEIGHT = 64;
+export const MINI_PLAYER_HEIGHT = 72;
+export const HEADER_HEIGHT = 56;

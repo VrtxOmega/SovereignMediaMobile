@@ -1,8 +1,9 @@
 import os
 from PIL import Image
 
-src_img_path = r"C:\Users\rlope\.gemini\antigravity\brain\cb3223a2-341c-485f-8bc8-72c340a67c68\sovereign_audio_premium_icon_1775184815506.png"
-base_res_path = r"C:\Veritas_Lab\SovereignAudio\android\app\src\main\res"
+# Update these paths to point to your local icon source and Android res directory
+src_img_path = os.path.expanduser(os.path.join("~", "sovereign_audio_icon.png"))
+base_res_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "android", "app", "src", "main", "res")
 
 sizes = {
     "mipmap-mdpi": 48,

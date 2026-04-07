@@ -1,248 +1,151 @@
 /**
- * PlayerService
- * Wraps react-native-track-player.
- * Handles: playback, sleep timer with fade, audio focus, Bluetooth events.
+ * PlayerService.js
+ * TrackPlayer background service + high-level playback API.
+ * Lock screen controls, Bluetooth A2DP, chapter-aware seeking.
  */
+
 import TrackPlayer, {
-  Event,
   Capability,
-  State,
+  Event,
   RepeatMode,
+  State,
+  usePlaybackState,
+  useProgress,
+  useTrackPlayerEvents,
 } from 'react-native-track-player';
-import StateLedgerService from './StateLedgerService';
 import MediaSyncService from './MediaSyncService';
+import StateLedgerService from './StateLedgerService';
 
-let _initialized = false;
-let _sleepTimer = null;
-let _sleepFadeTimer = null;
-let _positionUpdateTimer = null;
-let _listeners = new Map();
+// ─── Background Playback Service (registered in index.js) ─────────────────
 
-const emit = (event, data) => {
-  _listeners.get(event)?.forEach(cb => { try { cb(data); } catch {} });
-};
+export async function PlaybackService() {
+  TrackPlayer.addEventListener(Event.RemotePlay,     () => TrackPlayer.play());
+  TrackPlayer.addEventListener(Event.RemotePause,    () => TrackPlayer.pause());
+  TrackPlayer.addEventListener(Event.RemoteStop,     () => TrackPlayer.stop());
+  TrackPlayer.addEventListener(Event.RemoteNext,     () => TrackPlayer.skipToNext());
+  TrackPlayer.addEventListener(Event.RemotePrevious, () => TrackPlayer.skipToPrevious());
+  TrackPlayer.addEventListener(Event.RemoteSeek,     (e) => TrackPlayer.seekTo(e.position));
+  TrackPlayer.addEventListener(Event.RemoteJumpForward,  (e) => PlayerService.seekForward(e.interval || 30));
+  TrackPlayer.addEventListener(Event.RemoteJumpBackward, (e) => PlayerService.seekBackward(e.interval || 15));
 
-export async function setupPlayer() {
-  if (_initialized) return;
-
-  await TrackPlayer.setupPlayer({
-    minBuffer: 15,
-    maxBuffer: 60,
-    playBuffer: 3,
-    backBuffer: 60,
-    waitForBuffer: true,
+  TrackPlayer.addEventListener(Event.PlaybackProgressUpdated, async (e) => {
+    const track = await TrackPlayer.getActiveTrack();
+    if (track?.id) {
+      StateLedgerService.updatePosition(track.id, Math.round(e.position * 1000));
+    }
   });
 
-  await TrackPlayer.updateOptions({
-    capabilities: [
-      Capability.Play,
-      Capability.Pause,
-      Capability.SkipToNext,
-      Capability.SkipToPrevious,
-      Capability.SeekTo,
-      Capability.JumpForward,
-      Capability.JumpBackward,
-    ],
-    compactCapabilities: [Capability.Play, Capability.Pause, Capability.SkipToNext],
-    jumpInterval: 30,
-    progressUpdateEventThrottle: 1000,
-    android: {
-      appKilledPlaybackBehavior: 'StopPlaybackAndRemoveNotification',
-    },
-  });
-
-  // Event listeners
-  TrackPlayer.addEventListener(Event.PlaybackState, async ({ state }) => {
-    const position = await TrackPlayer.getPosition();
-    const posMs = Math.round(position * 1000);
-
-    if (state === State.Paused || state === State.Stopped) {
-      StateLedgerService.updatePosition(posMs, true);
-      if (state === State.Stopped) {
-        await StateLedgerService.endSession(posMs);
-        emit('stopped', { posMs });
-      } else {
-        emit('paused', { posMs });
+  TrackPlayer.addEventListener(Event.PlaybackState, async (e) => {
+    if (e.state === State.Stopped || e.state === State.None) {
+      const track = await TrackPlayer.getActiveTrack();
+      if (track?.id) {
+        const pos = await TrackPlayer.getPosition();
+        await StateLedgerService.endSession(track.id, Math.round(pos * 1000));
       }
     }
-
-    if (state === State.Playing) {
-      emit('playing', {});
-      _startPositionUpdates();
-    }
-
-    emit('state_change', { state });
   });
-
-  TrackPlayer.addEventListener(Event.PlaybackTrackChanged, async ({ nextTrack }) => {
-    if (nextTrack !== null) {
-      const track = await TrackPlayer.getTrack(nextTrack);
-      emit('track_changed', { track });
-    }
-  });
-
-  TrackPlayer.addEventListener(Event.PlaybackError, ({ message }) => {
-    console.error('[PLAYER] Playback error:', message);
-    emit('error', { message });
-  });
-
-  TrackPlayer.addEventListener(Event.RemotePlay, () => TrackPlayer.play());
-  TrackPlayer.addEventListener(Event.RemotePause, () => TrackPlayer.pause());
-  TrackPlayer.addEventListener(Event.RemoteStop, () => TrackPlayer.stop());
-  TrackPlayer.addEventListener(Event.RemoteSeek, ({ position }) => TrackPlayer.seekTo(position));
-  TrackPlayer.addEventListener(Event.RemoteJumpForward, async ({ interval }) => {
-    const pos = await TrackPlayer.getPosition();
-    await TrackPlayer.seekTo(pos + interval);
-  });
-  TrackPlayer.addEventListener(Event.RemoteJumpBackward, async ({ interval }) => {
-    const pos = await TrackPlayer.getPosition();
-    await TrackPlayer.seekTo(Math.max(0, pos - interval));
-  });
-
-  _initialized = true;
-  console.log('[PLAYER] Initialized');
 }
 
-export async function loadTrack(track, startPositionMs = 0) {
-  await TrackPlayer.reset();
-  await TrackPlayer.add({
-    id: track.id,
-    url: track.url, // Can be local file:// or remote stream URL
-    title: track.title,
-    artist: track.artist || 'Unknown',
-    album: track.album || '',
-    artwork: track.artwork,
-    duration: track.duration,
-    headers: track.headers,
-  });
+// ─── PlayerService API ────────────────────────────────────────────────────
 
-  if (startPositionMs > 0) {
-    await TrackPlayer.seekTo(startPositionMs / 1000);
-  }
-
-  StateLedgerService.startSession(track.id, track.title, (track.duration || 0) * 1000);
-}
-
-export async function play() {
-  await TrackPlayer.play();
-}
-
-export async function pause() {
-  const pos = await TrackPlayer.getPosition();
-  await TrackPlayer.pause();
-  StateLedgerService.updatePosition(Math.round(pos * 1000), true);
-}
-
-export async function seekTo(seconds) {
-  await TrackPlayer.seekTo(seconds);
-  const posMs = Math.round(seconds * 1000);
-  StateLedgerService.updatePosition(posMs, false);
-}
-
-export async function seekToMs(ms) {
-  await seekTo(ms / 1000);
-}
-
-export async function skipForward(seconds = 30) {
-  const pos = await TrackPlayer.getPosition();
-  await seekTo(pos + seconds);
-}
-
-export async function skipBackward(seconds = 30) {
-  const pos = await TrackPlayer.getPosition();
-  await seekTo(Math.max(0, pos - seconds));
-}
-
-export async function setRate(rate) {
-  await TrackPlayer.setRate(rate);
-}
-
-export async function getPosition() {
-  return await TrackPlayer.getPosition();
-}
-
-export async function getDuration() {
-  return await TrackPlayer.getDuration();
-}
-
-export async function getState() {
-  return await TrackPlayer.getState();
-}
-
-export async function getProgress() {
-  return await TrackPlayer.getProgress();
-}
-
-/**
- * Sleep timer with 30-second audio fade.
- */
-export function setSleepTimer(minutes, onExpire) {
-  clearSleepTimer();
-
-  if (!minutes || minutes <= 0) return;
-
-  console.log(`[PLAYER] Sleep timer: ${minutes}min`);
-  emit('sleep_timer_set', { minutes });
-
-  const totalMs = minutes * 60 * 1000;
-  const fadeStartMs = totalMs - 30000;
-
-  // Fade start
-  if (fadeStartMs > 0) {
-    _sleepFadeTimer = setTimeout(async () => {
-      console.log('[PLAYER] Sleep fade starting...');
-      emit('sleep_fade_start', {});
-      // Fade volume from 1.0 to 0.0 over 30 seconds
-      await _fadeVolume(1.0, 0.0, 30000);
-    }, fadeStartMs);
-  }
-
-  // Final stop
-  _sleepTimer = setTimeout(async () => {
-    await pause();
-    await TrackPlayer.setVolume(1.0); // Reset volume
-    emit('sleep_timer_expired', {});
-    onExpire?.();
-    console.log('[PLAYER] Sleep timer expired');
-  }, totalMs);
-}
-
-export function clearSleepTimer() {
-  clearTimeout(_sleepTimer);
-  clearTimeout(_sleepFadeTimer);
-  _sleepTimer = null;
-  _sleepFadeTimer = null;
-  TrackPlayer.setVolume(1.0);
-  emit('sleep_timer_cleared', {});
-}
-
-async function _fadeVolume(from, to, durationMs) {
-  const steps = 60;
-  const interval = durationMs / steps;
-  const step = (to - from) / steps;
-  let current = from;
-
-  for (let i = 0; i < steps; i++) {
-    current += step;
-    await TrackPlayer.setVolume(Math.max(0, Math.min(1, current)));
-    await new Promise(r => setTimeout(r, interval));
-  }
-}
-
-function _startPositionUpdates() {
-  clearInterval(_positionUpdateTimer);
-  _positionUpdateTimer = setInterval(async () => {
+class PlayerServiceClass {
+  async setup() {
     try {
-      const pos = await TrackPlayer.getPosition();
-      const posMs = Math.round(pos * 1000);
-      StateLedgerService.updatePosition(posMs, false);
-      emit('position_update', { posMs });
-    } catch {}
-  }, 5000); // Push to desktop every 5 seconds during playback
+      await TrackPlayer.setupPlayer({
+        maxCacheSize: 1024 * 5, // 5MB stream buffer
+      });
+      await TrackPlayer.updateOptions({
+        capabilities: [
+          Capability.Play,
+          Capability.Pause,
+          Capability.Stop,
+          Capability.SkipToNext,
+          Capability.SkipToPrevious,
+          Capability.SeekTo,
+          Capability.JumpForward,
+          Capability.JumpBackward,
+        ],
+        compactCapabilities: [
+          Capability.Play,
+          Capability.Pause,
+          Capability.SkipToNext,
+        ],
+        progressUpdateEventInterval: 5,
+        jumpInterval: 30,
+        forwardJumpInterval: 30,
+        backwardJumpInterval: 15,
+        notificationCapabilities: [
+          Capability.Play,
+          Capability.Pause,
+          Capability.SeekTo,
+          Capability.SkipToNext,
+          Capability.SkipToPrevious,
+        ],
+      });
+    } catch (err) {
+      // Already initialized
+    }
+  }
+
+  async loadAlbum(tracks, startIndex = 0, startPositionMs = 0) {
+    await TrackPlayer.reset();
+
+    const formatted = tracks.map(t => ({
+      id:          t.id || t.path,
+      url:         t.localPath || MediaSyncService.buildStreamUrl(t.path),
+      title:       t.title || t.filename,
+      artist:      t.author || t.artist || 'Unknown',
+      album:       t.album || t.collection,
+      artwork:     t.artworkUrl || MediaSyncService.buildCoverUrl(t.coverHash),
+      duration:    t.durationMs ? t.durationMs / 1000 : undefined,
+      headers:     MediaSyncService.getRequestHeaders(),
+      _raw:        t,
+    }));
+
+    await TrackPlayer.add(formatted);
+    await TrackPlayer.skip(startIndex);
+
+    if (startPositionMs > 0) {
+      await TrackPlayer.seekTo(startPositionMs / 1000);
+    }
+
+    const track = formatted[startIndex];
+    if (track) {
+      StateLedgerService.startSession(track.id, track.title, startPositionMs);
+    }
+  }
+
+  async play()  { await TrackPlayer.play(); }
+  async pause() { await TrackPlayer.pause(); }
+  async stop()  { await TrackPlayer.stop(); }
+
+  async seekTo(ms) {
+    await TrackPlayer.seekTo(ms / 1000);
+  }
+
+  async seekForward(seconds = 30) {
+    const pos = await TrackPlayer.getPosition();
+    await TrackPlayer.seekTo(pos + seconds);
+  }
+
+  async seekBackward(seconds = 15) {
+    const pos = await TrackPlayer.getPosition();
+    await TrackPlayer.seekTo(Math.max(0, pos - seconds));
+  }
+
+  async next()     { await TrackPlayer.skipToNext(); }
+  async previous() { await TrackPlayer.skipToPrevious(); }
+
+  async getState()    { return await TrackPlayer.getPlaybackState(); }
+  async getPosition() { return (await TrackPlayer.getPosition()) * 1000; } // returns ms
+  async getDuration() { return (await TrackPlayer.getDuration()) * 1000; }
+  async getActiveTrack() { return await TrackPlayer.getActiveTrack(); }
+
+  async setRepeat(mode) {
+    await TrackPlayer.setRepeatMode(mode || RepeatMode.Off);
+  }
 }
 
-export function on(event, cb) {
-  if (!_listeners.has(event)) _listeners.set(event, new Set());
-  _listeners.get(event).add(cb);
-  return () => _listeners.get(event)?.delete(cb);
-}
+export const PlayerService = new PlayerServiceClass();
+export { usePlaybackState, useProgress, useTrackPlayerEvents, State, Event };
+export default PlayerService;

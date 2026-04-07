@@ -12,6 +12,7 @@ import re
 import aiohttp
 from aiohttp import web
 from pathlib import Path
+from contextlib import closing
 from tinytag import TinyTag
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -31,58 +32,55 @@ connected_clients = set()
 
 def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS media_state (
-            track_id TEXT PRIMARY KEY,
-            position_ms INTEGER DEFAULT 0,
-            is_paused INTEGER DEFAULT 1,
-            updated_at INTEGER DEFAULT 0,
-            title TEXT,
-            artist TEXT
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS session_ledger (
-            id TEXT PRIMARY KEY,
-            track_id TEXT,
-            track_title TEXT,
-            start_position_ms INTEGER,
-            end_position_ms INTEGER,
-            total_listened_ms INTEGER,
-            device TEXT,
-            started_at INTEGER,
-            ended_at INTEGER,
-            seal TEXT,
-            created_at INTEGER DEFAULT (strftime('%s','now'))
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS media_state (
+                track_id TEXT PRIMARY KEY,
+                position_ms INTEGER DEFAULT 0,
+                is_paused INTEGER DEFAULT 1,
+                updated_at INTEGER DEFAULT 0,
+                title TEXT,
+                artist TEXT
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS session_ledger (
+                id TEXT PRIMARY KEY,
+                track_id TEXT,
+                track_title TEXT,
+                start_position_ms INTEGER,
+                end_position_ms INTEGER,
+                total_listened_ms INTEGER,
+                device TEXT,
+                started_at INTEGER,
+                ended_at INTEGER,
+                seal TEXT,
+                created_at INTEGER DEFAULT (strftime('%s','now'))
+            )
+        ''')
+        conn.commit()
 
 def save_position(track_id, position_ms, is_paused):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('''
-        INSERT INTO media_state (track_id, position_ms, is_paused, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(track_id) DO UPDATE SET
-            position_ms = excluded.position_ms,
-            is_paused = excluded.is_paused,
-            updated_at = excluded.updated_at
-    ''', (track_id, position_ms, 1 if is_paused else 0, int(time.time() * 1000)))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute('''
+            INSERT INTO media_state (track_id, position_ms, is_paused, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(track_id) DO UPDATE SET
+                position_ms = excluded.position_ms,
+                is_paused = excluded.is_paused,
+                updated_at = excluded.updated_at
+        ''', (track_id, position_ms, 1 if is_paused else 0, int(time.time() * 1000)))
+        conn.commit()
 
 def get_position(track_id):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        'SELECT position_ms, is_paused, updated_at FROM media_state WHERE track_id = ?',
-        (track_id,)
-    ).fetchone()
-    conn.close()
-    if row:
-        return {'position_ms': row[0], 'is_paused': bool(row[1]), 'updated_at': row[2]}
-    return {'position_ms': 0, 'is_paused': True, 'updated_at': 0}
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            'SELECT position_ms, is_paused, updated_at FROM media_state WHERE track_id = ?',
+            (track_id,)
+        ).fetchone()
+        if row:
+            return {'position_ms': row[0], 'is_paused': bool(row[1]), 'updated_at': row[2]}
+        return {'position_ms': 0, 'is_paused': True, 'updated_at': 0}
 
 class LibraryState:
     def __init__(self):
@@ -122,6 +120,7 @@ def build_library():
                         "id": album_id,
                         "title": album_title,
                         "artist": tag.artist or tag.albumartist or "Unknown",
+                        "coverHash": album_id,
                         "tracks": []
                     }
                     
@@ -131,7 +130,6 @@ def build_library():
                             f.write(tag.get_image())
                     if cover_path.exists():
                         new_cover_paths[album_id] = cover_path
-                        new_albums[album_id]["coverArt"] = f"http://localhost:{PORT}/cover/{album_id}"
                         
                 new_albums[album_id]["tracks"].append({
                     "id": track_id,
@@ -206,13 +204,16 @@ def build_library():
                 if vid_type == "tv" and not show_name:
                     show_name = "Unknown Show"
 
-                # Check for poster
+                # Check for poster and register in cover_paths for serving
                 poster_path = None
                 for candidate in [f"{p.stem}.jpg", f"{p.stem}.png", "poster.jpg", "cover.jpg", "folder.jpg"]:
                     cp = p.parent / candidate
                     if cp.exists():
-                        poster_path = str(cp)
+                        poster_path = cp
                         break
+                
+                if poster_path:
+                    new_cover_paths[vid_id] = poster_path
                         
                 new_video = {
                     "id": vid_id,
@@ -220,7 +221,7 @@ def build_library():
                     "type": vid_type,
                     "genre": p.parent.name if p.parent != VIDEOS_DIR else "Cinema",
                     "path": str(p),
-                    "poster": poster_path
+                    "coverHash": vid_id,
                 }
                 
                 if vid_type == "tv":
@@ -343,23 +344,34 @@ async def handle_cover(request):
     # 1. Resolve from AppData sovereign-media/covers (supports both naming patterns)
     appdata_base = Path(os.getenv('APPDATA')) / 'sovereign-media' / 'covers'
     
+    cache_headers = {
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Access-Control-Allow-Origin': '*',
+    }
+    
     # Check direct ID match first (most common: {id}.jpg)
     for ext in ['.jpg', '.png']:
         direct = appdata_base / f"{album_id}{ext}"
         if direct.exists():
-            return web.FileResponse(direct)
+            resp = web.FileResponse(direct)
+            resp.headers.update(cache_headers)
+            return resp
     
     # Check book_ prefixed match (book_{id}.jpg)
     for ext in ['.jpg', '.png']:
         prefixed = appdata_base / f"book_{album_id}{ext}"
         if prefixed.exists():
-            return web.FileResponse(prefixed)
+            resp = web.FileResponse(prefixed)
+            resp.headers.update(cache_headers)
+            return resp
 
     # 2. Fallback to legacy Audio tracking map
     cover_path = get_cover_path(album_id)
     if not cover_path or not cover_path.exists():
         return web.Response(status=404)
-    return web.FileResponse(cover_path)
+    resp = web.FileResponse(cover_path)
+    resp.headers.update(cache_headers)
+    return resp
 
 # ══════════════════════════════════════════════════════════════
 # HTTP TELEMETRY (React Native WebSocket Fallback)
@@ -429,6 +441,9 @@ async def handle_ws(request):
                 
                 if cmd == 'HEARTBEAT':
                     await ws.send_str(json.dumps({'type': 'HEARTBEAT_ACK', 'ts': data.get('ts')}))
+
+                elif cmd == 'PING':
+                    await ws.send_str(json.dumps({'type': 'PONG'}))
                     
                 elif cmd == 'WAKE_SYNC_REQUEST':
                     pass # Legacy. State is now bundled directly through /library via HTTP.
@@ -462,7 +477,16 @@ async def handle_ws(request):
 
 async def handle_library(request):
     """Serve structured Album JSON list alongside Sovereign Library Metadata"""
-    manifest = {'albums': scan_grouped_library(), 'Books': [], 'Video': library_state.videos}
+    
+    # Inject playhead state into Videos
+    videos = list(library_state.videos)
+    for vid in videos:
+        state = get_position(vid.get('id'))
+        vid['lastPositionMs'] = state.get('position_ms', 0)
+        vid['lastPlayedAt'] = state.get('updated_at', 0)
+        vid['isPaused'] = state.get('is_paused', True)
+        
+    manifest = {'Audio': scan_grouped_library(), 'Books': [], 'Video': videos}
     try:
         appdata = Path(os.getenv('APPDATA')) / 'sovereign-media'
         
@@ -470,7 +494,15 @@ async def handle_library(request):
         if books_path.exists():
             with open(books_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                manifest['Books'] = data
+                books = data.get('books', []) if isinstance(data, dict) else data
+                for book in books:
+                    book['coverHash'] = book.get('id', '')
+                    state = get_position(book.get('id'))
+                    if state and 'position_ms' in state:
+                        book['lastPositionMs'] = state['position_ms']
+                        book['lastPlayedAt'] = state['updated_at']
+                        book['isPaused'] = state.get('is_paused', True)
+                manifest['Books'] = books
 
         # sovereign_video_library.json static manifest is no longer required due to dynamic scan
     except Exception as e:

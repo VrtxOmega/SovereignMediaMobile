@@ -1,543 +1,366 @@
-import React, { useState, useEffect } from 'react';
+/**
+ * SettingsScreen.jsx — System tab. CONFIG | STORAGE | LEDGER sub-tabs.
+ * Network config, cache stats, ledger metrics.
+ */
+
+import React, { useState, useEffect, useCallback } from 'react';
 import {
-  View, Text, TextInput, TouchableOpacity, StyleSheet,
-  KeyboardAvoidingView, Platform, ScrollView, Switch, Alert, Image,
+  View, Text, ScrollView, TouchableOpacity, TextInput,
+  StyleSheet, Switch, ActivityIndicator, Alert,
 } from 'react-native';
-import { colors, spacing, radius, typography } from '../theme/veritas';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { COLORS, FONTS, SPACING, RADIUS } from '../theme/veritas';
 import MediaSyncService from '../services/MediaSyncService';
 import OfflineBufferService from '../services/OfflineBufferService';
 import StateLedgerService from '../services/StateLedgerService';
-import { SovereignHeader, SovereignFooter } from '../components/SovereignBranding';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const CONN_KEY = '@omega_host_ip';
-const BUFFER_KEY = '@omega_buffer_limit';
-const VAULT_KEY = '@omega_vault_limit';
-const BLE_KEY = '@omega_ble_enabled';
-const A2DP_KEY = '@omega_a2dp_force';
-const VERBOSE_KEY = '@omega_verbose_logs';
+const TABS = ['⚙ CONFIG', '⬡ STORAGE', '◈ LEDGER'];
 
-const formatBytes = (bytes) => {
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
-  return `${Math.round(bytes / 1024 / 1024 * 10) / 10}MB`;
-};
+// ─── CONFIG Tab ───────────────────────────────────────────────────────────
 
-export default function SettingsScreen() {
-  const [ip, setIp] = useState('');
-  const [savedIp, setSavedIp] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [btEnabled, setBtEnabled] = useState(true);
+function ConfigTab() {
+  const [tunnelUrl,   setTunnelUrl]   = useState('');
+  const [lanIp,       setLanIp]       = useState('');
+  const [connected,   setConnected]   = useState(false);
+  const [testing,     setTesting]     = useState(false);
+  const [bleEnabled,  setBleEnabled]  = useState(false);
   const [a2dpEnabled, setA2dpEnabled] = useState(false);
-  const [sysLogEnabled, setSysLogEnabled] = useState(false);
-  const [bufferLimit, setBufferLimit] = useState(4);
-  const [vaultLimit, setVaultLimit] = useState(32);
-  const [activeSection, setActiveSection] = useState('config'); // config | storage | ledger
-  
-  // Storage state
-  const [bufferedTracks, setBufferedTracks] = useState({});
-  const [offlineBooks, setOfflineBooks] = useState([]);
-  const [transientSizeBytes, setTransientSizeBytes] = useState(0);
-  const [persistentSizeBytes, setPersistentSizeBytes] = useState(0);
-  const [ledger, setLedger] = useState([]);
-  const [ledgerStats, setLedgerStats] = useState({});
 
   useEffect(() => {
-    const loadSettings = async () => {
-      const [val, buf, vault, ble, a2dp, vLog] = await Promise.all([
-        AsyncStorage.getItem(CONN_KEY),
-        AsyncStorage.getItem(BUFFER_KEY),
-        AsyncStorage.getItem(VAULT_KEY),
-        AsyncStorage.getItem(BLE_KEY),
-        AsyncStorage.getItem(A2DP_KEY),
-        AsyncStorage.getItem(VERBOSE_KEY)
-      ]);
-      if (val) { setIp(val); setSavedIp(val); }
-      if (buf) setBufferLimit(parseInt(buf, 10));
-      if (vault) setVaultLimit(parseInt(vault, 10));
-      if (ble !== null) setBtEnabled(ble === 'true');
-      if (a2dp !== null) setA2dpEnabled(a2dp === 'true');
-      if (vLog !== null) setSysLogEnabled(vLog === 'true');
-    };
-    loadSettings();
-    loadBufferInfo();
-    loadLedger();
-    
-    const unsubProgress = OfflineBufferService.on('download_complete', () => loadBufferInfo());
-    const unsubDeleted = OfflineBufferService.on('buffer_deleted', () => loadBufferInfo());
-    return () => { unsubProgress(); unsubDeleted(); };
+    AsyncStorage.getItem('@sovereign_host').then(v => v && setTunnelUrl(v));
+    AsyncStorage.getItem('@sovereign_lan_ip').then(v => v && setLanIp(v));
+    setConnected(MediaSyncService.isConnected);
+    const unsub = MediaSyncService.on('connected', setConnected);
+    return unsub;
   }, []);
 
-  const loadBufferInfo = async () => {
-    const meta = OfflineBufferService.meta || {};
-    setBufferedTracks(meta);
-    const [transSize, persSize] = await Promise.all([
-      OfflineBufferService.getTransientSize(),
-      OfflineBufferService.getPersistentSize()
-    ]);
-    setTransientSizeBytes(transSize);
-    setPersistentSizeBytes(persSize);
-    // Aggregate book groups
-    const booksMap = {};
-    Object.entries(meta).forEach(([trackId, info]) => {
-      if (info.albumData && info.albumData.albumId) {
-        const aId = info.albumData.albumId;
-        if (!booksMap[aId]) {
-          booksMap[aId] = { ...info.albumData, downloadedTracks: 0, totalSize: 0, trackIds: [] };
-        }
-        booksMap[aId].downloadedTracks += 1;
-        booksMap[aId].totalSize += (info.size || 0);
-        booksMap[aId].trackIds.push(trackId);
+  const testConnection = async () => {
+    setTesting(true);
+    try {
+      const target = tunnelUrl || (lanIp ? `http://${lanIp}:5002` : null);
+      if (!target) return;
+      const res = await fetch(`${target.replace(/\/$/, '')}/health`, {
+        headers: { 'Bypass-Tunnel-Reminder': 'true' },
+      });
+      if (res.ok) {
+        if (tunnelUrl) await MediaSyncService.setHost(tunnelUrl);
+        if (lanIp)     await MediaSyncService.setLanIp(lanIp);
+        Alert.alert('Connected', 'Sovereign node reachable.');
+      } else {
+        Alert.alert('Failed', `HTTP ${res.status}`);
       }
-    });
-    setOfflineBooks(Object.values(booksMap));
+    } catch (err) {
+      Alert.alert('Error', err.message);
+    } finally {
+      setTesting(false);
+    }
   };
 
-  const loadLedger = () => {
-    const sessions = StateLedgerService.getLedger();
-    setLedger([...sessions].reverse().slice(0, 50));
-    setLedgerStats(StateLedgerService.getLedgerStats());
-  };
+  return (
+    <ScrollView style={styles.tabContent}>
+      <Text style={styles.sectionHeader}>NETWORK RELAY</Text>
 
-  const handleToggle = async (key, val, setter) => {
-    setter(val);
-    await AsyncStorage.setItem(key, String(val));
-    if (key === VERBOSE_KEY) MediaSyncService.setVerboseLogs?.(val);
-  };
+      <View style={styles.statusRow}>
+        <View style={[styles.statusDot, { backgroundColor: connected ? COLORS.success : COLORS.error }]} />
+        <Text style={styles.statusLabel}>{connected ? 'NODE CONNECTED' : 'NODE OFFLINE'}</Text>
+      </View>
 
-  const handleBufferLimitCycle = async () => {
-    const options = [2, 4, 8, 16, 32, 64, -1];
-    const nextIdx = (options.indexOf(bufferLimit) + 1) % options.length;
-    setBufferLimit(options[nextIdx]);
-    await AsyncStorage.setItem(BUFFER_KEY, String(options[nextIdx]));
-  };
+      <Text style={styles.fieldLabel}>TUNNEL URL</Text>
+      <TextInput
+        style={styles.input}
+        value={tunnelUrl}
+        onChangeText={setTunnelUrl}
+        placeholder="https://your-subdomain.loca.lt"
+        placeholderTextColor={COLORS.textDim}
+        autoCapitalize="none"
+        autoCorrect={false}
+      />
 
-  const handleVaultLimitCycle = async () => {
-    const options = [16, 32, 64, 128, 256, 512, 1024, -1];
-    const nextIdx = (options.indexOf(vaultLimit) + 1) % options.length;
-    setVaultLimit(options[nextIdx]);
-    await AsyncStorage.setItem(VAULT_KEY, String(options[nextIdx]));
-  };
+      <Text style={styles.fieldLabel}>LAN IP (OPTIONAL)</Text>
+      <TextInput
+        style={styles.input}
+        value={lanIp}
+        onChangeText={setLanIp}
+        placeholder="192.168.1.x"
+        placeholderTextColor={COLORS.textDim}
+        autoCapitalize="none"
+        keyboardType="numeric"
+      />
 
-  const handleUpdate = async () => {
-    if (!ip.trim()) return;
-    setLoading(true);
-    await MediaSyncService.init(ip.trim());
-    setSavedIp(ip.trim());
-    setTimeout(() => setLoading(false), 800);
-  };
+      <TouchableOpacity style={styles.button} onPress={testConnection} disabled={testing}>
+        {testing
+          ? <ActivityIndicator color={COLORS.obsidian} />
+          : <Text style={styles.buttonText}>TEST & SAVE CONNECTION</Text>
+        }
+      </TouchableOpacity>
 
-  const handlePurge = async () => {
-    await AsyncStorage.removeItem(CONN_KEY);
-    setIp('');
-    setSavedIp('');
-    MediaSyncService.ws?.close();
-  };
+      <View style={styles.divider} />
 
-  const handleDeleteBuffer = (trackId) => {
-    Alert.alert('Remove Buffer', 'Delete this locally buffered file?', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Delete', style: 'destructive', onPress: () => OfflineBufferService.deleteBuffer(trackId) }
-    ]);
-  };
+      <Text style={styles.sectionHeader}>HARDWARE</Text>
 
-  const handleClearAll = () => {
-    Alert.alert('Clear All Buffers',
-      `Delete all ${Object.keys(bufferedTracks).length} buffered files (${formatBytes(transientSizeBytes)})?`,
+      <View style={styles.toggleRow}>
+        <Text style={styles.toggleLabel}>BLE METADATA BROADCAST</Text>
+        <Switch
+          value={bleEnabled}
+          onValueChange={setBleEnabled}
+          trackColor={{ false: COLORS.obsidianBorder, true: COLORS.goldDim }}
+          thumbColor={bleEnabled ? COLORS.gold : COLORS.textDim}
+        />
+      </View>
+
+      <View style={styles.toggleRow}>
+        <Text style={styles.toggleLabel}>A2DP AUDIO SINK</Text>
+        <Switch
+          value={a2dpEnabled}
+          onValueChange={setA2dpEnabled}
+          trackColor={{ false: COLORS.obsidianBorder, true: COLORS.goldDim }}
+          thumbColor={a2dpEnabled ? COLORS.gold : COLORS.textDim}
+        />
+      </View>
+    </ScrollView>
+  );
+}
+
+// ─── STORAGE Tab ──────────────────────────────────────────────────────────
+
+function StorageTab() {
+  const [vaultStats,  setVaultStats]  = useState({ count: 0, totalMB: '0', entries: [] });
+  const [bufferStats, setBufferStats] = useState({ count: 0, totalMB: '0', entries: [] });
+
+  useEffect(() => {
+    setVaultStats(OfflineBufferService.getVaultStats());
+    setBufferStats(OfflineBufferService.getBufferStats());
+
+    const u1 = OfflineBufferService.on('vault_updated',  setVaultStats);
+    const u2 = OfflineBufferService.on('buffer_updated', setBufferStats);
+    return () => { u1(); u2(); };
+  }, []);
+
+  const clearBuffer = () => {
+    Alert.alert(
+      'Clear Buffer',
+      'Remove all transient cached files?',
       [
         { text: 'Cancel', style: 'cancel' },
-        { text: 'Clear All', style: 'destructive', onPress: () => OfflineBufferService.clearAllBuffers() }
+        { text: 'Clear', style: 'destructive', onPress: () => OfflineBufferService.clearBuffer() },
       ]
     );
   };
 
-  const trackCount = Object.keys(bufferedTracks).filter(k => !bufferedTracks[k].isPersistent).length;
+  return (
+    <ScrollView style={styles.tabContent}>
+      {/* Vault */}
+      <Text style={styles.sectionHeader}>PERMANENT VAULT</Text>
+      <View style={styles.statsGrid}>
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{vaultStats.count}</Text>
+          <Text style={styles.statLabel}>VAULTED</Text>
+        </View>
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{vaultStats.totalMB}MB</Text>
+          <Text style={styles.statLabel}>STORED</Text>
+        </View>
+      </View>
+
+      {vaultStats.entries.map(entry => (
+        <View key={entry.path} style={styles.entryRow}>
+          <Text style={styles.entryName} numberOfLines={1}>{entry.filename}</Text>
+          <Text style={styles.entrySize}>{(entry.size / 1024 / 1024).toFixed(1)}MB</Text>
+        </View>
+      ))}
+
+      <View style={styles.divider} />
+
+      {/* Buffer */}
+      <Text style={styles.sectionHeader}>TRANSIENT BUFFER</Text>
+      <View style={styles.statsGrid}>
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{bufferStats.count}</Text>
+          <Text style={styles.statLabel}>CACHED</Text>
+        </View>
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{bufferStats.totalMB}MB</Text>
+          <Text style={styles.statLabel}>/ {bufferStats.maxGB}GB MAX</Text>
+        </View>
+      </View>
+
+      {bufferStats.entries.map(entry => (
+        <View key={entry.path} style={styles.entryRow}>
+          <Text style={styles.entryName} numberOfLines={1}>{entry.filename}</Text>
+          <Text style={styles.entrySize}>{(entry.size / 1024 / 1024).toFixed(1)}MB</Text>
+          <TouchableOpacity onPress={() => OfflineBufferService.removeFromBuffer(entry.path)}>
+            <Text style={styles.entryDelete}>✕</Text>
+          </TouchableOpacity>
+        </View>
+      ))}
+
+      <TouchableOpacity style={[styles.button, styles.dangerButton]} onPress={clearBuffer}>
+        <Text style={[styles.buttonText, { color: COLORS.error }]}>CLEAR ALL BUFFERS</Text>
+      </TouchableOpacity>
+    </ScrollView>
+  );
+}
+
+// ─── LEDGER Tab ───────────────────────────────────────────────────────────
+
+function LedgerTab() {
+  const metrics  = StateLedgerService.getMetrics();
+  const sessions = StateLedgerService.getAllSessions().slice(0, 50);
 
   return (
-    <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <SovereignHeader />
-      {/* Section Tabs */}
-      <View style={styles.sectionTabs}>
-        {[['config', '⚙ CONFIG'], ['storage', '⬡ STORAGE'], ['ledger', '◈ LEDGER']].map(([key, label]) => (
+    <ScrollView style={styles.tabContent}>
+      <Text style={styles.sectionHeader}>VERITAS LEDGER</Text>
+
+      <View style={styles.statsGrid}>
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{metrics.totalHours}h</Text>
+          <Text style={styles.statLabel}>TOTAL HOURS</Text>
+        </View>
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{metrics.totalSessions}</Text>
+          <Text style={styles.statLabel}>SESSIONS</Text>
+        </View>
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{metrics.uniqueTracks}</Text>
+          <Text style={styles.statLabel}>UNIQUE TRACKS</Text>
+        </View>
+      </View>
+
+      <View style={styles.divider} />
+      <Text style={styles.sectionHeader}>SEAL CHAIN</Text>
+
+      {sessions.map(session => (
+        <View key={session.trackId} style={styles.sealRow}>
+          <View style={styles.sealLeft}>
+            <Text style={styles.sealTitle} numberOfLines={1}>{session.title}</Text>
+            <Text style={styles.sealMeta}>
+              {session.sessions.length} session{session.sessions.length !== 1 ? 's' : ''} ·{' '}
+              {((session.totalMs || 0) / 1000 / 60).toFixed(0)}min
+            </Text>
+          </View>
+          <Text style={styles.sealHash}>{session.seal || '—'}</Text>
+        </View>
+      ))}
+
+      {sessions.length === 0 && (
+        <Text style={styles.emptyText}>NO SESSIONS RECORDED</Text>
+      )}
+    </ScrollView>
+  );
+}
+
+// ─── Main Settings Screen ─────────────────────────────────────────────────
+
+export default function SettingsScreen() {
+  const [activeTab, setActiveTab] = useState(0);
+
+  return (
+    <SafeAreaView style={styles.root} edges={['top']}>
+      {/* Sub-tab bar */}
+      <View style={styles.tabBar}>
+        {TABS.map((tab, i) => (
           <TouchableOpacity
-            key={key}
-            style={[styles.sectionTab, activeSection === key && styles.sectionTabActive]}
-            onPress={() => setActiveSection(key)}
+            key={tab}
+            style={[styles.tab, activeTab === i && styles.tabActive]}
+            onPress={() => setActiveTab(i)}
           >
-            <Text style={[styles.sectionTabText, activeSection === key && styles.sectionTabTextActive]}>{label}</Text>
+            <Text style={[styles.tabText, activeTab === i && styles.tabTextActive]}>
+              {tab}
+            </Text>
           </TouchableOpacity>
         ))}
       </View>
 
-      <ScrollView contentContainerStyle={styles.scroll}>
-        
-        {activeSection === 'config' && (
-          <>
-            {/* Network */}
-            <View style={styles.card}>
-              <Text style={styles.sectionHeader}>☁ CLOUD RELAY ARCHITECTURE</Text>
-              <Text style={styles.label}>TELEMETRY HOST URL OR IP ADDRESS</Text>
-              <TextInput
-                style={styles.input}
-                value={ip}
-                onChangeText={setIp}
-                placeholder="omega-audio-rlopez.loca.lt"
-                placeholderTextColor={colors.textFaint}
-                autoCapitalize="none"
-                autoCorrect={false}
-              />
-              <TouchableOpacity 
-                style={[styles.btn, (!ip || loading) && styles.btnDisabled]} 
-                onPress={handleUpdate}
-                disabled={!ip || loading}
-              >
-                <Text style={styles.btnText}>
-                  {loading ? 'SECURING SOCKET...' : 'ENFORCE NEW ROUTE'}
-                </Text>
-              </TouchableOpacity>
-            </View>
-
-            {/* Hardware */}
-            <View style={styles.card}>
-              <Text style={styles.sectionHeader}>🎧 HARDWARE & STORAGE</Text>
-              
-              <View style={styles.toggleRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.toggleTitle}>High-Fidelity BLE Broadcast</Text>
-                  <Text style={styles.toggleSub}>Push full track metadata to dash/smartwatch</Text>
-                </View>
-                <Switch value={btEnabled} onValueChange={(val) => handleToggle(BLE_KEY, val, setBtEnabled)}
-                  trackColor={{ false: colors.obsidian, true: colors.goldDim }}
-                  thumbColor={btEnabled ? colors.gold : colors.textDim} />
-              </View>
-              
-              <View style={styles.separator} />
-
-              <View style={styles.toggleRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.toggleTitle}>Force A2DP Audio Sink</Text>
-                  <Text style={styles.toggleSub}>Lock output to connected Bluetooth device</Text>
-                </View>
-                <Switch value={a2dpEnabled} onValueChange={(val) => handleToggle(A2DP_KEY, val, setA2dpEnabled)}
-                  trackColor={{ false: colors.obsidian, true: colors.goldDim }}
-                  thumbColor={a2dpEnabled ? colors.gold : colors.textDim} />
-              </View>
-
-              <View style={styles.separator} />
-
-              <View style={styles.toggleRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.toggleTitle}>Temp Buffer Limit</Text>
-                  <Text style={styles.toggleSub}>Max storage for streaming tracks</Text>
-                </View>
-                <TouchableOpacity style={styles.limitBtn} onPress={handleBufferLimitCycle}>
-                  <Text style={styles.limitBtnText}>{bufferLimit === -1 ? 'UNLIMITED' : `${bufferLimit} GB`}</Text>
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.separator} />
-
-              <View style={styles.toggleRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.toggleTitle}>Offline Book Vault Limit</Text>
-                  <Text style={styles.toggleSub}>Max storage for permanent downloads</Text>
-                </View>
-                <TouchableOpacity style={styles.limitBtn} onPress={handleVaultLimitCycle}>
-                  <Text style={styles.limitBtnText}>{vaultLimit === -1 ? 'UNLIMITED' : `${vaultLimit} GB`}</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-
-            {/* Diagnostics */}
-            <View style={styles.card}>
-              <Text style={styles.sectionHeader}>📊 DIAGNOSTICS & LOGGING</Text>
-              <View style={styles.toggleRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.toggleTitle}>Verbose Telemetry Logs</Text>
-                  <Text style={styles.toggleSub}>Show handshake trace / heartbeat ping latency</Text>
-                </View>
-                <Switch value={sysLogEnabled} onValueChange={(val) => handleToggle(VERBOSE_KEY, val, setSysLogEnabled)}
-                  trackColor={{ false: colors.obsidian, true: colors.goldDim }}
-                  thumbColor={sysLogEnabled ? colors.gold : colors.textDim} />
-              </View>
-            </View>
-
-            {/* Danger Zone */}
-            <View style={[styles.card, { borderColor: colors.red + '44' }]}>
-              <Text style={[styles.sectionHeader, { color: colors.red }]}>⚠ LOCAL STATE DANGER ZONE</Text>
-              <Text style={styles.label}>PURGE ALL CACHE AND AUTH TOKENS</Text>
-              <TouchableOpacity style={styles.purgeBtn} onPress={handlePurge}>
-                <Text style={styles.purgeBtnText}>FLUSH STORAGE CONFIG</Text>
-              </TouchableOpacity>
-            </View>
-          </>
-        )}
-
-        {activeSection === 'storage' && (
-          <>
-            {/* Stats bar */}
-            <View style={styles.statsCard}>
-              <View style={styles.stat}>
-                <Text style={styles.statNum}>{trackCount}</Text>
-                <Text style={styles.statLabel}>Cached</Text>
-              </View>
-              <View style={styles.stat}>
-                <Text style={styles.statNum}>{Math.round(transientSizeBytes / 1024 / 1024)}MB</Text>
-                <Text style={styles.statLabel}>Buffer</Text>
-              </View>
-              <View style={styles.stat}>
-                <Text style={styles.statNum}>{offlineBooks.length}</Text>
-                <Text style={styles.statLabel}>Vaulted</Text>
-              </View>
-              <View style={styles.stat}>
-                <Text style={styles.statNum}>{Math.round(persistentSizeBytes / 1024 / 1024)}MB</Text>
-                <Text style={styles.statLabel}>Vault</Text>
-              </View>
-            </View>
-
-            {/* Transient cache */}
-            {trackCount > 0 && (
-              <>
-                <Text style={styles.sectionLabel}>TRANSIENT CACHE ({trackCount})</Text>
-                <View style={styles.storageCard}>
-                  {Object.entries(bufferedTracks)
-                    .filter(([, info]) => !info.isPersistent)
-                    .sort((a, b) => (b[1].downloadedAt || 0) - (a[1].downloadedAt || 0))
-                    .map(([trackId, info]) => (
-                    <View key={trackId} style={styles.trackRow}>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.trackName} numberOfLines={1}>{info.filename}</Text>
-                        <Text style={styles.trackMeta}>{formatBytes(info.size)} · {new Date(info.downloadedAt).toLocaleDateString()}</Text>
-                      </View>
-                      <TouchableOpacity style={styles.deleteBtn} onPress={() => handleDeleteBuffer(trackId)}>
-                        <Text style={styles.deleteBtnText}>✕</Text>
-                      </TouchableOpacity>
-                    </View>
-                  ))}
-                </View>
-                <TouchableOpacity style={styles.clearAllBtn} onPress={handleClearAll}>
-                  <Text style={styles.clearAllText}>Clear All Buffers</Text>
-                </TouchableOpacity>
-              </>
-            )}
-
-            {/* Offline books */}
-            {offlineBooks.length > 0 && (
-              <>
-                <Text style={styles.sectionLabel}>PERMANENT VAULT ({offlineBooks.length})</Text>
-                {offlineBooks.map(book => (
-                  <View key={book.albumId} style={styles.bookRow}>
-                    <View style={styles.bookThumbWrap}>
-                      {book.coverUrl ? (
-                        <Image source={{ uri: book.coverUrl, headers: { 'Bypass-Tunnel-Reminder': 'true' } }} style={styles.bookThumb} />
-                      ) : (
-                        <View style={styles.bookThumbPlaceholder}><Text style={{ color: colors.goldDim, fontSize: 18 }}>Ω</Text></View>
-                      )}
-                    </View>
-                    <View style={{ flex: 1, marginLeft: 10 }}>
-                      <Text style={styles.trackName} numberOfLines={2}>{book.albumName}</Text>
-                      <Text style={styles.trackMeta}>{book.downloadedTracks}/{book.totalTracks} parts · {formatBytes(book.totalSize)}</Text>
-                    </View>
-                  </View>
-                ))}
-              </>
-            )}
-
-            {trackCount === 0 && offlineBooks.length === 0 && (
-              <View style={styles.emptyState}>
-                <Text style={styles.emptyIcon}>⬡</Text>
-                <Text style={styles.emptyTitle}>No Offline Content</Text>
-                <Text style={styles.emptySub}>Files buffer automatically when you play them</Text>
-              </View>
-            )}
-          </>
-        )}
-
-        {activeSection === 'ledger' && (
-          <>
-            <View style={styles.statsCard}>
-              <View style={styles.stat}>
-                <Text style={styles.statNum}>{ledgerStats.sessions || 0}</Text>
-                <Text style={styles.statLabel}>Sessions</Text>
-              </View>
-              <View style={styles.stat}>
-                <Text style={styles.statNum}>{ledgerStats.totalListenedHours || 0}h</Text>
-                <Text style={styles.statLabel}>Listened</Text>
-              </View>
-              <View style={styles.stat}>
-                <Text style={styles.statNum}>{ledgerStats.uniqueTracks || 0}</Text>
-                <Text style={styles.statLabel}>Titles</Text>
-              </View>
-            </View>
-
-            {ledger.length > 0 ? (
-              <View style={styles.storageCard}>
-                {ledger.map((session, i) => {
-                  const duration = Math.round((session.totalListenedMs || 0) / 60000);
-                  return (
-                    <View key={i} style={styles.ledgerRow}>
-                      <View style={styles.sealBar} />
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.trackName} numberOfLines={1}>{session.trackTitle}</Text>
-                        <Text style={styles.trackMeta}>
-                          {duration}min · {new Date(session.endedAt || session.startedAt).toLocaleDateString()}
-                        </Text>
-                        <Text style={styles.sealHash} numberOfLines={1}>SEAL: {session.seal?.substr(0, 20)}...</Text>
-                      </View>
-                    </View>
-                  );
-                })}
-              </View>
-            ) : (
-              <View style={styles.emptyState}>
-                <Text style={styles.emptyIcon}>◈</Text>
-                <Text style={styles.emptyTitle}>No Sessions Yet</Text>
-                <Text style={styles.emptySub}>Sessions are VERITAS-sealed as you listen</Text>
-              </View>
-            )}
-          </>
-        )}
-
-      </ScrollView>
-      <SovereignFooter />
-    </KeyboardAvoidingView>
+      {activeTab === 0 && <ConfigTab />}
+      {activeTab === 1 && <StorageTab />}
+      {activeTab === 2 && <LedgerTab />}
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.obsidian },
-  scroll: { padding: spacing.xl, paddingBottom: 100 },
+  root: { flex: 1, backgroundColor: COLORS.obsidian },
 
-  // Section tabs
-  sectionTabs: {
+  tabBar: {
     flexDirection: 'row',
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    paddingTop: 50,
-    backgroundColor: colors.obsidian,
+    backgroundColor: COLORS.obsidianDeep,
+    borderBottomWidth: 1, borderBottomColor: COLORS.gold,
   },
-  sectionTab: {
-    flex: 1,
-    paddingVertical: 12,
+  tab: {
+    flex: 1, paddingVertical: SPACING.sm + 2,
     alignItems: 'center',
   },
-  sectionTabActive: {
-    borderBottomWidth: 2,
-    borderBottomColor: colors.gold,
-  },
-  sectionTabText: {
-    fontFamily: 'Courier New',
-    fontSize: 10,
-    color: colors.textDim,
-    letterSpacing: 1,
-    fontWeight: 'bold',
-  },
-  sectionTabTextActive: { color: colors.gold },
+  tabActive: { borderBottomWidth: 2, borderBottomColor: COLORS.gold },
+  tabText:   { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 10, letterSpacing: 1 },
+  tabTextActive: { color: COLORS.gold },
 
-  // Config section
-  header: { alignItems: 'center', marginBottom: spacing.xl, marginTop: spacing.md },
-  headerTitle: { ...typography.title, fontSize: 24, letterSpacing: 4 },
-  headerSub: { fontFamily: 'Courier New', fontSize: 10, color: colors.goldDim, marginTop: spacing.xs, letterSpacing: 1 },
+  tabContent: { flex: 1, padding: SPACING.md },
 
-  card: {
-    backgroundColor: colors.obsidianMid,
-    borderWidth: 1, borderColor: colors.border,
-    borderRadius: radius.md, padding: spacing.lg,
-    marginBottom: spacing.xl,
-  },
   sectionHeader: {
-    fontFamily: 'Courier New', fontSize: 11, fontWeight: 'bold',
-    color: colors.gold, letterSpacing: 2, marginBottom: spacing.md,
+    color: COLORS.gold, fontFamily: FONTS.mono, fontSize: 11,
+    letterSpacing: 3, marginBottom: SPACING.sm, marginTop: SPACING.md,
   },
 
-  label: { fontFamily: 'Courier New', fontSize: 10, color: colors.textDim, marginBottom: spacing.xs },
+  statusRow: { flexDirection: 'row', alignItems: 'center', marginBottom: SPACING.md },
+  statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: SPACING.sm },
+  statusLabel: { color: COLORS.textPrimary, fontFamily: FONTS.mono, fontSize: 12 },
+
+  fieldLabel: { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 10, letterSpacing: 2, marginBottom: 4 },
   input: {
-    backgroundColor: colors.obsidianDark, borderWidth: 1, borderColor: colors.border,
-    padding: spacing.md, borderRadius: radius.md,
-    color: colors.gold, fontFamily: 'Courier New', marginBottom: spacing.lg,
+    backgroundColor: COLORS.obsidianCard,
+    borderWidth: 1, borderColor: COLORS.obsidianBorder,
+    borderRadius: RADIUS.md, padding: SPACING.md,
+    color: COLORS.textPrimary, fontFamily: FONTS.mono, fontSize: 13,
+    marginBottom: SPACING.md,
   },
 
-  btn: {
-    backgroundColor: colors.gold, padding: spacing.md,
-    borderRadius: radius.md, alignItems: 'center',
-    shadowColor: colors.gold, shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.3, shadowRadius: 10,
+  button: {
+    backgroundColor: COLORS.gold, borderRadius: RADIUS.md,
+    paddingVertical: SPACING.md, alignItems: 'center', marginVertical: SPACING.sm,
   },
-  btnDisabled: { backgroundColor: colors.obsidian, borderColor: colors.border, borderWidth: 1, shadowOpacity: 0 },
-  btnText: { color: colors.obsidianDark, fontFamily: 'Courier New', fontWeight: 'bold', letterSpacing: 2 },
+  dangerButton: {
+    backgroundColor: 'transparent',
+    borderWidth: 1, borderColor: COLORS.error,
+  },
+  buttonText: { color: COLORS.obsidian, fontFamily: FONTS.mono, fontSize: 12, letterSpacing: 2, fontWeight: 'bold' },
 
-  purgeBtn: {
-    backgroundColor: 'transparent', borderWidth: 1, borderColor: colors.red,
-    padding: spacing.md, borderRadius: radius.md, alignItems: 'center', marginTop: spacing.xs,
+  toggleRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: SPACING.sm,
+    borderBottomWidth: 1, borderBottomColor: COLORS.obsidianBorder,
   },
-  purgeBtnText: { color: colors.red, fontFamily: 'Courier New', fontWeight: 'bold', letterSpacing: 2 },
+  toggleLabel: { color: COLORS.textPrimary, fontFamily: FONTS.mono, fontSize: 12 },
 
-  toggleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: spacing.sm },
-  toggleTitle: { fontFamily: 'Courier New', fontSize: 13, color: colors.text, marginBottom: 2 },
-  toggleSub: { fontFamily: 'Courier New', fontSize: 9, color: colors.textDim },
-  separator: { height: 1, backgroundColor: colors.border, marginVertical: spacing.sm },
+  divider: { height: 1, backgroundColor: COLORS.obsidianBorder, marginVertical: SPACING.md },
 
-  limitBtn: {
-    backgroundColor: colors.obsidianDark, borderWidth: 1, borderColor: colors.border,
-    paddingHorizontal: spacing.md, paddingVertical: spacing.sm, borderRadius: radius.md,
+  statsGrid: { flexDirection: 'row', gap: SPACING.sm, marginBottom: SPACING.md },
+  statCard: {
+    flex: 1, backgroundColor: COLORS.obsidianCard,
+    borderRadius: RADIUS.md, padding: SPACING.md,
+    alignItems: 'center', borderWidth: 1, borderColor: COLORS.obsidianBorder,
   },
-  limitBtnText: { fontFamily: 'Courier New', fontSize: 13, color: colors.gold, fontWeight: 'bold' },
+  statValue: { color: COLORS.gold, fontFamily: FONTS.mono, fontSize: 22, fontWeight: 'bold' },
+  statLabel: { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 9, letterSpacing: 1, marginTop: 4 },
 
-  // Storage + Ledger sections
-  statsCard: {
-    flexDirection: 'row', backgroundColor: colors.obsidianMid,
-    borderRadius: radius.md, borderWidth: 1, borderColor: colors.border,
-    padding: spacing.lg, marginBottom: spacing.lg,
-  },
-  stat: { flex: 1, alignItems: 'center' },
-  statNum: { fontFamily: 'Courier New', fontSize: 18, color: colors.gold, fontWeight: 'bold' },
-  statLabel: { fontFamily: 'Courier New', fontSize: 8, color: colors.textDim, letterSpacing: 1, marginTop: 2 },
-
-  sectionLabel: {
-    fontFamily: 'Courier New', fontSize: 10, color: colors.goldDim,
-    marginBottom: 8, letterSpacing: 1,
-  },
-  storageCard: {
-    backgroundColor: colors.obsidianMid, borderRadius: radius.md,
-    borderWidth: 1, borderColor: colors.border, overflow: 'hidden', marginBottom: spacing.md,
-  },
-  trackRow: {
-    flexDirection: 'row', alignItems: 'center', padding: spacing.md,
-    borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.03)',
-  },
-  trackName: { fontFamily: 'Courier New', fontSize: 11, color: colors.text },
-  trackMeta: { fontFamily: 'Courier New', fontSize: 9, color: colors.textDim, marginTop: 2 },
-  deleteBtn: { padding: spacing.sm },
-  deleteBtnText: { color: colors.red, fontSize: 14 },
-
-  bookRow: {
+  entryRow: {
     flexDirection: 'row', alignItems: 'center',
-    backgroundColor: colors.obsidianMid, borderRadius: radius.md,
-    borderWidth: 1, borderColor: colors.border,
-    padding: spacing.md, marginBottom: spacing.sm,
+    paddingVertical: SPACING.sm,
+    borderBottomWidth: 1, borderBottomColor: COLORS.obsidianBorder,
   },
-  bookThumbWrap: {},
-  bookThumb: { width: 44, height: 44, borderRadius: radius.sm },
-  bookThumbPlaceholder: {
-    width: 44, height: 44, borderRadius: radius.sm,
-    backgroundColor: colors.obsidianLight, alignItems: 'center', justifyContent: 'center',
-  },
+  entryName:   { flex: 1, color: COLORS.textPrimary, fontFamily: FONTS.mono, fontSize: 11 },
+  entrySize:   { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 11, marginHorizontal: SPACING.sm },
+  entryDelete: { color: COLORS.error, fontFamily: FONTS.mono, fontSize: 14, paddingHorizontal: SPACING.sm },
 
-  clearAllBtn: {
-    borderWidth: 1, borderColor: colors.red,
-    borderRadius: radius.md, padding: spacing.md,
-    alignItems: 'center', marginBottom: spacing.lg,
+  sealRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: SPACING.sm,
+    borderBottomWidth: 1, borderBottomColor: COLORS.obsidianBorder,
   },
-  clearAllText: { fontFamily: 'Courier New', fontSize: 11, color: colors.red, letterSpacing: 1 },
+  sealLeft:  { flex: 1 },
+  sealTitle: { color: COLORS.textPrimary, fontFamily: FONTS.mono, fontSize: 12 },
+  sealMeta:  { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 10, marginTop: 2 },
+  sealHash:  { color: COLORS.gold, fontFamily: FONTS.mono, fontSize: 10 },
 
-  ledgerRow: {
-    flexDirection: 'row', alignItems: 'flex-start', padding: spacing.md,
-    borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.03)',
-  },
-  sealBar: { width: 3, minHeight: 40, backgroundColor: colors.gold, borderRadius: 2, marginRight: 10 },
-  sealHash: { fontFamily: 'Courier New', fontSize: 8, color: colors.goldDim, marginTop: 2 },
-
-  emptyState: { alignItems: 'center', padding: spacing.xxl },
-  emptyIcon: { fontSize: 40, color: colors.goldDim, marginBottom: spacing.lg },
-  emptyTitle: { fontFamily: 'Courier New', fontSize: 13, color: colors.text, letterSpacing: 2, marginBottom: spacing.sm },
-  emptySub: { fontFamily: 'Courier New', fontSize: 10, color: colors.textDim, textAlign: 'center' },
+  emptyText: { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 12, letterSpacing: 2, textAlign: 'center', marginTop: SPACING.xl },
 });

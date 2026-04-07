@@ -1,192 +1,170 @@
 /**
- * StateLedgerService
- * Bi-directional playhead sync with desktop SQLite.
- * VERITAS seals every listening session.
+ * StateLedgerService.js
+ * VERITAS-sealed listening sessions. Tracks progression locally,
+ * stamps with UNIX timestamps, hashes with local seal, syncs to PC.
  */
+
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { AppState } from 'react-native';
+import CryptoJS from 'crypto-js';
 import MediaSyncService from './MediaSyncService';
 
-const LEDGER_KEY = 'omega_media_ledger';
-const SESSION_KEY = 'omega_current_session';
+const STORAGE_KEY     = '@sovereign_ledger';
+const SYNC_DEBOUNCE   = 5000;  // 5s debounce on playhead POST
 
-class StateLedgerService {
+class StateLedgerServiceClass {
   constructor() {
-    this.currentSession = null;
-    this.ledger = [];
-    this.syncUnsubscribe = null;
+    this.sessions     = {};   // trackId → { trackId, title, totalMs, lastPos, sessions: [], seal }
+    this.syncTimers   = {};
+    this.appState     = AppState.currentState;
+    this._appStateSub = null;
   }
 
   async init() {
-    const stored = await AsyncStorage.getItem(LEDGER_KEY);
-    if (stored) {
-      try { this.ledger = JSON.parse(stored); } catch {}
-    }
-
-    // Listen for wake-sync response from desktop
-    this.syncUnsubscribe = MediaSyncService.on('WAKE_SYNC_RESPONSE', (data) => {
-      this._handleWakeSync(data);
-    });
-
-    // Resume any incomplete session
-    const savedSession = await AsyncStorage.getItem(SESSION_KEY);
-    if (savedSession) {
-      try { this.currentSession = JSON.parse(savedSession); } catch {}
-    }
-
-    console.log(`[LEDGER] Initialized — ${this.ledger.length} sealed sessions`);
+    await this._load();
+    this._watchAppState();
   }
 
-  /**
-   * Wake-sync: pull desktop's latest position before rendering UI.
-   * Returns the authoritative playhead state.
-   */
-  async wakeSync(trackId) {
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        // Desktop didn't respond — use local state
-        resolve(this._getLocalState(trackId));
-      }, 3000);
+  // ─── Session Recording ────────────────────────────────────────────────────
 
-      const unsub = MediaSyncService.on('WAKE_SYNC_RESPONSE', (data) => {
-        clearTimeout(timeout);
-        unsub();
-        if (data.track_id === trackId) {
-          resolve({
-            positionMs: data.position_ms,
-            trackId: data.track_id,
-            source: 'desktop',
-          });
-        } else {
-          resolve(this._getLocalState(trackId));
+  startSession(trackId, title, positionMs) {
+    if (!this.sessions[trackId]) {
+      this.sessions[trackId] = {
+        trackId,
+        title,
+        totalMs: 0,
+        lastPos: positionMs,
+        sessions: [],
+        seal: null,
+      };
+    }
+    const session = this.sessions[trackId];
+    session.lastPos   = positionMs;
+    session._sessionStart = Date.now();
+    session._sessionStartPos = positionMs;
+  }
+
+  updatePosition(trackId, positionMs) {
+    const session = this.sessions[trackId];
+    if (!session) return;
+    session.lastPos = positionMs;
+
+    // Debounced sync to PC
+    clearTimeout(this.syncTimers[trackId]);
+    this.syncTimers[trackId] = setTimeout(() => {
+      MediaSyncService.postPlayhead(trackId, positionMs);
+    }, SYNC_DEBOUNCE);
+  }
+
+  async endSession(trackId, finalPositionMs) {
+    const session = this.sessions[trackId];
+    if (!session) return;
+
+    const durationMs = Date.now() - (session._sessionStart || Date.now());
+    session.totalMs += durationMs;
+    session.lastPos  = finalPositionMs;
+
+    session.sessions.push({
+      startPos:   session._sessionStartPos || 0,
+      endPos:     finalPositionMs,
+      durationMs,
+      timestamp:  Date.now(),
+    });
+
+    // Seal the entry
+    session.seal = this._generateSeal(session);
+
+    // Immediate sync on session end
+    clearTimeout(this.syncTimers[trackId]);
+    MediaSyncService.postPlayhead(trackId, finalPositionMs);
+
+    await this._save();
+  }
+
+  // ─── Position Retrieval ───────────────────────────────────────────────────
+
+  getLastPosition(trackId) {
+    return this.sessions[trackId]?.lastPos || 0;
+  }
+
+  getSession(trackId) {
+    return this.sessions[trackId] || null;
+  }
+
+  getAllSessions() {
+    return Object.values(this.sessions);
+  }
+
+  // ─── Metrics ─────────────────────────────────────────────────────────────
+
+  getMetrics() {
+    const all          = Object.values(this.sessions);
+    const totalMs      = all.reduce((s, e) => s + e.totalMs, 0);
+    const totalHours   = (totalMs / 1000 / 60 / 60).toFixed(1);
+    const totalSessions= all.reduce((s, e) => s + e.sessions.length, 0);
+    const uniqueTracks = all.length;
+
+    return { totalHours, totalSessions, uniqueTracks };
+  }
+
+  // ─── VERITAS Seal ─────────────────────────────────────────────────────────
+
+  _generateSeal(session) {
+    const payload = JSON.stringify({
+      trackId:    session.trackId,
+      totalMs:    session.totalMs,
+      lastPos:    session.lastPos,
+      sessCount:  session.sessions.length,
+      ts:         Date.now(),
+    });
+    const hash = CryptoJS.SHA256(payload).toString();
+    return `SEAL:${hash.slice(0, 8)}`;
+  }
+
+  verifySeal(trackId) {
+    const session = this.sessions[trackId];
+    if (!session?.seal) return false;
+    const expected = this._generateSeal(session);
+    return session.seal.slice(5, 13) === expected.slice(5, 13);
+  }
+
+  // ─── App State (background flush) ────────────────────────────────────────
+
+  _watchAppState() {
+    this._appStateSub = AppState.addEventListener('change', async (nextState) => {
+      if (this.appState === 'active' && nextState.match(/inactive|background/)) {
+        // Flush all pending syncs immediately before backgrounding
+        for (const [trackId, timer] of Object.entries(this.syncTimers)) {
+          clearTimeout(timer);
+          const session = this.sessions[trackId];
+          if (session) {
+            await MediaSyncService.postPlayhead(trackId, session.lastPos);
+          }
         }
-      });
-
-      MediaSyncService.send('WAKE_SYNC_REQUEST', { track_id: trackId });
+        await this._save();
+      }
+      this.appState = nextState;
     });
   }
 
-  _handleWakeSync(data) {
-    // Store the desktop's authoritative state locally
-    this._saveLocalState(data.track_id, data.position_ms);
+  // ─── Persistence ─────────────────────────────────────────────────────────
+
+  async _save() {
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(this.sessions));
   }
 
-  async _getLocalState(trackId) {
-    const stored = await AsyncStorage.getItem(`pos_${trackId}`);
-    if (stored) {
-      return { positionMs: parseInt(stored), trackId, source: 'local' };
-    }
-    return { positionMs: 0, trackId, source: 'none' };
-  }
-
-  async _saveLocalState(trackId, positionMs) {
-    await AsyncStorage.setItem(`pos_${trackId}`, String(positionMs));
-  }
-
-  /**
-   * Start a new listening session.
-   */
-  startSession(trackId, trackTitle, totalDurationMs) {
-    this.currentSession = {
-      id: `session_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`,
-      trackId,
-      trackTitle,
-      startedAt: Date.now(),
-      startPositionMs: 0,
-      endPositionMs: 0,
-      totalDurationMs,
-      totalListenedMs: 0,
-      device: 'mobile',
-    };
-
-    AsyncStorage.setItem(SESSION_KEY, JSON.stringify(this.currentSession));
-    console.log(`[LEDGER] Session started: ${trackTitle}`);
-  }
-
-  /**
-   * Update current position — called frequently during playback.
-   * Pushes to desktop and saves locally.
-   */
-  updatePosition(positionMs, isPaused = false) {
-    if (this.currentSession) {
-      this.currentSession.endPositionMs = positionMs;
-    }
-
-    // Push to desktop
-    if (this.currentSession) {
-      MediaSyncService.pushPosition(
-        this.currentSession.trackId,
-        positionMs,
-        isPaused
-      );
-    }
-
-    // Save locally (debounced by caller)
-    if (this.currentSession?.trackId) {
-      AsyncStorage.setItem(`pos_${this.currentSession.trackId}`, String(positionMs));
-    }
-  }
-
-  /**
-   * End the current session and VERITAS seal it.
-   */
-  async endSession(finalPositionMs) {
-    if (!this.currentSession) return null;
-
-    this.currentSession.endPositionMs = finalPositionMs;
-    this.currentSession.endedAt = Date.now();
-    this.currentSession.totalListenedMs = this.currentSession.endedAt - this.currentSession.startedAt;
-
-    // VERITAS seal
-    const session = { ...this.currentSession };
-    const sealPayload = `${session.id}:${session.trackId}:${session.startPositionMs}:${session.endPositionMs}:${session.endedAt}`;
-    session.seal = await this._sha256(sealPayload);
-
-    // Append to ledger
-    this.ledger.push(session);
-    if (this.ledger.length > 500) this.ledger = this.ledger.slice(-500); // Cap at 500
-
-    await AsyncStorage.setItem(LEDGER_KEY, JSON.stringify(this.ledger));
-    await AsyncStorage.removeItem(SESSION_KEY);
-
-    // Push sealed session to desktop
-    MediaSyncService.send('SESSION_SEALED', { session });
-
-    console.log(`[LEDGER] ✓ Session sealed: ${session.trackTitle} · ${Math.round(session.totalListenedMs / 60000)}min · SEAL: ${session.seal.substr(0, 16)}...`);
-
-    this.currentSession = null;
-    return session;
-  }
-
-  async _sha256(message) {
-    // Simple hash using available crypto — in production use react-native-aes-crypto
-    let hash = 0;
-    for (let i = 0; i < message.length; i++) {
-      const char = message.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash;
-    }
-    // In production: use proper SHA-256 from react-native-aes-crypto
-    return Math.abs(hash).toString(16).padStart(16, '0') +
-           Date.now().toString(16) +
-           Math.random().toString(16).substr(2, 16);
-  }
-
-  getLedger() { return this.ledger; }
-  getCurrentSession() { return this.currentSession; }
-
-  getLedgerStats() {
-    const totalMs = this.ledger.reduce((sum, s) => sum + (s.totalListenedMs || 0), 0);
-    const uniqueTracks = new Set(this.ledger.map(s => s.trackId)).size;
-    return {
-      sessions: this.ledger.length,
-      totalListenedHours: Math.round(totalMs / 3600000 * 10) / 10,
-      uniqueTracks,
-    };
+  async _load() {
+    try {
+      const raw = await AsyncStorage.getItem(STORAGE_KEY);
+      if (raw) this.sessions = JSON.parse(raw);
+    } catch (_) {}
   }
 
   destroy() {
-    this.syncUnsubscribe?.();
+    this._appStateSub?.remove();
+    for (const timer of Object.values(this.syncTimers)) clearTimeout(timer);
   }
 }
 
-export default new StateLedgerService();
+export const StateLedgerService = new StateLedgerServiceClass();
+export default StateLedgerService;

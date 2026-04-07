@@ -1,325 +1,246 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+/**
+ * LibraryScreen.jsx — Audio tab. 2-column masonry grid of audiobook covers.
+ * Auto-resume indicators, long-press to vault, tap to navigate to AlbumScreen.
+ */
+
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   View, Text, FlatList, TouchableOpacity, TextInput,
-  StyleSheet, Dimensions, Image, RefreshControl,
+  StyleSheet, ActivityIndicator, RefreshControl, Dimensions,
 } from 'react-native';
-import { colors, spacing, radius, typography } from '../theme/veritas';
+import FastImage from 'react-native-fast-image';
+import { createStackNavigator } from '@react-navigation/stack';
+import { COLORS, FONTS, SPACING, RADIUS } from '../theme/veritas';
 import MediaSyncService from '../services/MediaSyncService';
-import OfflineBufferService from '../services/OfflineBufferService';
-import { SovereignHeader, SovereignFooter } from '../components/SovereignBranding';
-import SovereignActionSheet from '../components/SovereignActionSheet';
+import StateLedgerService from '../services/StateLedgerService';
+import AlbumScreen from './AlbumScreen';
 
+const Stack = createStackNavigator();
 const { width: SCREEN_W } = Dimensions.get('window');
-const COLS = 2; // Bigger cards for albums
-const CARD_SIZE = (SCREEN_W - spacing.lg * 2 - spacing.sm * (COLS - 1)) / COLS;
+const CARD_W = (SCREEN_W - SPACING.md * 3) / 2;
+const CARD_H = CARD_W * 1.4;
 
-const AlbumCard = React.memo(({ album, onPress, onLongPress }) => {
-  const coverUri = MediaSyncService.getHttpUrl(`/cover/${album.id}`);
-  
+// ─── Cover Card ───────────────────────────────────────────────────────────
+
+function AlbumCard({ album, onPress, onLongPress }) {
+  const session  = StateLedgerService.getSession(album.id);
+  const progress = session && album.durationMs
+    ? Math.min(session.lastPos / album.durationMs, 1)
+    : 0;
+
   return (
     <TouchableOpacity
       style={styles.card}
       onPress={() => onPress(album)}
       onLongPress={() => onLongPress(album)}
-      activeOpacity={0.7}
+      activeOpacity={0.85}
     >
-      <View style={styles.coverWrapper}>
-        <Image 
-          source={{ 
-            uri: coverUri,
-            headers: { 'Bypass-Tunnel-Reminder': 'true', 'User-Agent': 'localtunnel' }
-          }} 
-          style={styles.cover} 
-          resizeMode="cover" 
-          defaultSource={null}
-        />
-        <View style={styles.coverBorder} />
-      </View>
+      <FastImage
+        style={styles.cover}
+        source={{
+          uri: MediaSyncService.buildCoverUrl(album.coverHash) || album.artwork,
+          headers: MediaSyncService.getRequestHeaders(),
+          priority: FastImage.priority.normal,
+        }}
+        resizeMode={FastImage.resizeMode.cover}
+      />
+
+      {/* In-progress bar */}
+      {progress > 0 && progress < 0.95 && (
+        <View style={styles.progressTrack}>
+          <View style={[styles.progressFill, { width: `${progress * 100}%` }]} />
+        </View>
+      )}
+
+      {/* Completed badge */}
+      {progress >= 0.95 && (
+        <View style={styles.completedBadge}>
+          <Text style={styles.completedText}>✓</Text>
+        </View>
+      )}
+
       <View style={styles.cardInfo}>
-        <Text style={styles.cardTitle} numberOfLines={2}>{album.name}</Text>
-        <Text style={styles.cardArtist} numberOfLines={1}>{album.artist || 'Podcast'}</Text>
+        <Text style={styles.cardTitle} numberOfLines={2}>{album.title}</Text>
+        <Text style={styles.cardAuthor} numberOfLines={1}>{album.author}</Text>
+        <Text style={styles.cardTracks}>{album.trackCount || 1} track{(album.trackCount || 1) !== 1 ? 's' : ''}</Text>
       </View>
     </TouchableOpacity>
   );
-});
+}
 
-const ModeIndicator = ({ mode }) => (
-  <View style={[styles.modeBadge, { borderColor: mode === 'online' ? colors.green : colors.gold }]}>
-    <View style={[styles.modeDot, { backgroundColor: mode === 'online' ? colors.green : colors.gold }]} />
-    <Text style={[styles.modeText, { color: mode === 'online' ? colors.green : colors.gold }]}>
-      {mode === 'online' ? 'STREAM' : 'BUFFER'}
-    </Text>
-  </View>
-);
+// ─── Library Grid ─────────────────────────────────────────────────────────
 
-export default function LibraryScreen({ navigation }) {
-  const [albums, setAlbums] = useState([]);
-  const [filtered, setFiltered] = useState([]);
-  const [search, setSearch] = useState('');
+function LibraryGrid({ navigation, onTrackPress }) {
+  const [albums,     setAlbums]     = useState([]);
+  const [filtered,   setFiltered]   = useState([]);
+  const [query,      setQuery]      = useState('');
+  const [loading,    setLoading]    = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [errorMsg, setErrorMsg] = useState(null);
-  const [mode, setMode] = useState(MediaSyncService.mode || 'offline');
-  const [actionSheetVisible, setActionSheetVisible] = useState(false);
-  const [selectedAlbum, setSelectedAlbum] = useState(null);
 
   useEffect(() => {
-    const unsubLib = MediaSyncService.on('LIBRARY_RESPONSE', (data) => {
-      const albumList = data.albums || [];
-      setAlbums(albumList);
-      setFiltered(albumList);
-      setRefreshing(false);
-      setErrorMsg(null);
+    const unsub = MediaSyncService.on('manifest', (manifest) => {
+      const data = manifest?.Audio || [];
+      setAlbums(data);
+      setFiltered(data);
+      setLoading(false);
     });
-
-    const unsubError = MediaSyncService.on('LIBRARY_ERROR', (msg) => {
-      setErrorMsg(msg);
-      setRefreshing(false);
-    });
-
-    const unsubMode = MediaSyncService.on('mode_change', ({ mode }) => {
-      setMode(mode);
-    });
-
-    MediaSyncService.fetchLibrary();
-
-    return () => { unsubLib(); unsubError(); unsubMode(); };
-  }, []);
-
-  useEffect(() => {
-    let result = [...albums];
-    if (search.trim()) {
-      const q = search.toLowerCase();
-      result = result.filter(a =>
-        a.name?.toLowerCase().includes(q) ||
-        a.artist?.toLowerCase().includes(q)
-      );
+    const existing = MediaSyncService.getManifest();
+    if (existing?.Audio) {
+      setAlbums(existing.Audio);
+      setFiltered(existing.Audio);
+      setLoading(false);
     }
-    result.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-    setFiltered(result);
-  }, [search, albums]);
-
-  const onRefresh = useCallback(() => {
-    setRefreshing(true);
-    MediaSyncService.fetchLibrary().finally(() => setRefreshing(false));
+    return unsub;
   }, []);
 
-  const handleAlbumPress = useCallback((album) => {
+  useEffect(() => {
+    if (!query.trim()) {
+      setFiltered(albums);
+    } else {
+      const q = query.toLowerCase();
+      setFiltered(albums.filter(a =>
+        a.title?.toLowerCase().includes(q) ||
+        a.author?.toLowerCase().includes(q)
+      ));
+    }
+  }, [query, albums]);
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await MediaSyncService.refreshManifest();
+    setRefreshing(false);
+  }, []);
+
+  const onPress = useCallback((album) => {
     navigation.navigate('Album', { album });
   }, [navigation]);
 
-  const handleAlbumLongPress = useCallback((album) => {
-    setSelectedAlbum(album);
-    setActionSheetVisible(true);
+  const onLongPress = useCallback((album) => {
+    // TODO: show action sheet for vault options
   }, []);
 
-  const renderAlbum = useCallback(({ item }) => (
-    <AlbumCard album={item} onPress={handleAlbumPress} onLongPress={handleAlbumLongPress} />
-  ), [handleAlbumPress, handleAlbumLongPress]);
-
-  const handleDownloadAll = async () => {
-    if (!selectedAlbum || !selectedAlbum.tracks) return;
-    for (const track of selectedAlbum.tracks) {
-      const url = MediaSyncService.getHttpUrl(`/stream/${track.id}`);
-      await OfflineBufferService.queueDownload(track.id, url, track.filename || `${track.id}.mp3`, track.size || 5000000, {
-        albumId: selectedAlbum.id,
-        albumName: selectedAlbum.name,
-        artist: selectedAlbum.artist,
-      }, false);
-    }
-  };
-
-  const handleRemoveAll = () => {
-    if (!selectedAlbum) return;
-    const buffered = OfflineBufferService.getBufferedTracks();
-    buffered.forEach(tid => {
-       const info = OfflineBufferService.getBufferInfo(tid);
-       if (info && info.albumData && info.albumData.albumId === selectedAlbum.id) {
-           OfflineBufferService.deleteBuffer(tid);
-       }
-    });
-  };
+  if (loading) {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator color={COLORS.gold} size="large" />
+        <Text style={styles.loadingText}>LOADING LIBRARY...</Text>
+      </View>
+    );
+  }
 
   return (
-    <View style={styles.container}>
-      <View style={styles.header}>
-        <SovereignHeader />
-        <View style={styles.headerTop}>
-          <View>
-            <Text style={styles.headerCount}>{filtered.length} collections</Text>
-          </View>
-          <ModeIndicator mode={mode} />
-        </View>
-
-        <View style={styles.searchRow}>
-          <TextInput
-            style={styles.searchInput}
-            value={search}
-            onChangeText={setSearch}
-            placeholder="Search podcasts & series..."
-            placeholderTextColor={colors.textFaint}
-          />
-        </View>
+    <View style={styles.root}>
+      {/* Search */}
+      <View style={styles.searchRow}>
+        <TextInput
+          style={styles.searchInput}
+          value={query}
+          onChangeText={setQuery}
+          placeholder="Search audiobooks..."
+          placeholderTextColor={COLORS.textDim}
+        />
+        <Text style={styles.countLabel}>{filtered.length} albums</Text>
       </View>
 
-      {filtered.length === 0 ? (
-        <View style={styles.empty}>
-          <Text style={styles.emptyTitle}>
-            {refreshing ? 'Syncing...' : (errorMsg ? 'Sync Failed' : 'Library Empty')}
-          </Text>
-          {errorMsg && <Text style={{color: colors.red, marginTop: 10, textAlign: 'center'}}>{errorMsg}</Text>}
-        </View>
-      ) : (
-        <FlatList
-          data={filtered}
-          renderItem={renderAlbum}
-          keyExtractor={a => a.id}
-          numColumns={COLS}
-          contentContainerStyle={styles.grid}
-          columnWrapperStyle={styles.row}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.gold} />}
-          showsVerticalScrollIndicator={false}
-          ListFooterComponent={<SovereignFooter />}
-        />
-      )}
-      
-      <FloatingMediaBar navigation={navigation} />
-
-      <SovereignActionSheet
-        visible={actionSheetVisible}
-        onClose={() => setActionSheetVisible(false)}
-        title={selectedAlbum?.name}
-        options={[
-          { label: '🌩 DOWNLOAD ALBUM', onPress: handleDownloadAll },
-          { label: '✖ REMOVE CACHE', destructive: true, onPress: handleRemoveAll },
-        ]}
+      <FlatList
+        data={filtered}
+        keyExtractor={(item) => item.id || item.path}
+        numColumns={2}
+        columnWrapperStyle={styles.row}
+        contentContainerStyle={styles.list}
+        renderItem={({ item }) => (
+          <AlbumCard album={item} onPress={onPress} onLongPress={onLongPress} />
+        )}
+        initialNumToRender={10}
+        maxToRenderPerBatch={8}
+        windowSize={5}
+        removeClippedSubviews
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor={COLORS.gold}
+          />
+        }
+        ListEmptyComponent={
+          <View style={styles.empty}>
+            <Text style={styles.emptyText}>NO AUDIOBOOKS FOUND</Text>
+          </View>
+        }
       />
     </View>
   );
 }
 
-function FloatingMediaBar({ navigation }) {
-  const { useActiveTrack } = require('react-native-track-player');
-  const activeTrack = useActiveTrack();
-  
-  if (!activeTrack) return null;
-  
+// ─── Stack Navigator (Library → Album) ───────────────────────────────────
+
+export default function LibraryScreen({ onTrackPress }) {
   return (
-    <TouchableOpacity 
-      style={styles.floatingBar}
-      activeOpacity={0.9}
-      onPress={() => navigation.navigate('NowPlaying', { 
-        track: {
-          id: activeTrack.id,
-          title: activeTrack.title,
-          url: activeTrack.url,
-          artist: activeTrack.artist,
-        },
-        albumArt: activeTrack.artwork 
-      })}
+    <Stack.Navigator
+      screenOptions={{
+        headerStyle:      { backgroundColor: COLORS.obsidianDeep },
+        headerTintColor:  COLORS.gold,
+        headerTitleStyle: { fontFamily: FONTS.mono, letterSpacing: 2 },
+        headerBackTitle:  '',
+      }}
     >
-      <View style={styles.floatingBarContent}>
-        {activeTrack.artwork && (
-          <Image source={{ uri: activeTrack.artwork }} style={styles.floatingArt} />
-        )}
-        <View style={styles.floatingTextCol}>
-          <Text style={styles.floatingTitle} numberOfLines={1}>{activeTrack.title}</Text>
-          <Text style={styles.floatingSubtitle}>N O W   P L A Y I N G</Text>
-        </View>
-        <Text style={styles.floatingIcon}>▶</Text>
-      </View>
-    </TouchableOpacity>
+      <Stack.Screen name="Library" options={{ title: 'AUDIO' }}>
+        {(props) => <LibraryGrid {...props} onTrackPress={onTrackPress} />}
+      </Stack.Screen>
+      <Stack.Screen name="Album" options={{ title: 'ALBUM' }}>
+        {(props) => <AlbumScreen {...props} onTrackPress={onTrackPress} />}
+      </Stack.Screen>
+    </Stack.Navigator>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.obsidian },
-  header: { padding: spacing.lg, borderBottomWidth: 1, borderBottomColor: colors.obsidianLight, backgroundColor: colors.obsidian, zIndex: 10, paddingTop: 60 },
-  headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: spacing.md },
-  sortTabActive: { backgroundColor: colors.goldFaint },
-  sortTabText: { fontFamily: 'Courier New', fontSize: 8, letterSpacing: 1, color: colors.textDim },
-  sortTabTextActive: { color: colors.gold },
+  root:  { flex: 1, backgroundColor: COLORS.obsidian },
+  center:{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.obsidian },
+  loadingText: { color: COLORS.gold, fontFamily: FONTS.mono, fontSize: 11, letterSpacing: 2, marginTop: SPACING.md },
 
-  grid: { padding: spacing.lg, paddingTop: spacing.md },
-  row: { gap: spacing.sm, marginBottom: spacing.sm },
+  searchRow: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm,
+    backgroundColor: COLORS.obsidianDeep,
+  },
+  searchInput: {
+    flex: 1, backgroundColor: COLORS.obsidianCard,
+    borderRadius: RADIUS.md, paddingHorizontal: SPACING.md,
+    paddingVertical: SPACING.sm, color: COLORS.textPrimary,
+    fontFamily: FONTS.mono, fontSize: 13,
+    borderWidth: 1, borderColor: COLORS.obsidianBorder,
+  },
+  countLabel: { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 11, marginLeft: SPACING.sm },
+
+  list: { paddingHorizontal: SPACING.md, paddingBottom: 120 },
+  row:  { justifyContent: 'space-between', marginTop: SPACING.md },
 
   card: {
-    width: CARD_SIZE,
-    backgroundColor: colors.obsidianMid,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-    overflow: 'hidden',
+    width: CARD_W, backgroundColor: COLORS.obsidianCard,
+    borderRadius: RADIUS.md, overflow: 'hidden',
+    borderWidth: 1, borderColor: COLORS.obsidianBorder,
   },
-  coverWrapper: {
-    width: CARD_SIZE,
-    height: CARD_SIZE,
-    position: 'relative',
-  },
-  cover: { width: CARD_SIZE, height: CARD_SIZE },
-  coverPlaceholder: {
-    width: CARD_SIZE, height: CARD_SIZE,
-    backgroundColor: colors.obsidian,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  coverPlaceholderIcon: { fontSize: 28, color: colors.goldDim },
-  coverBorder: {
-    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-    borderWidth: 1, borderColor: colors.goldFaint,
-  },
-  offlineBadge: {
-    position: 'absolute', bottom: 4, right: 4,
-    backgroundColor: 'rgba(10,10,12,0.85)',
-    borderRadius: 8, width: 16, height: 16,
-    alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: colors.gold,
-  },
-  offlineBadgeText: { fontSize: 9, color: colors.gold },
+  cover: { width: CARD_W, height: CARD_H },
 
-  cardInfo: { padding: spacing.sm },
-  cardTitle: { fontFamily: 'Courier New', fontSize: 9, color: colors.text, lineHeight: 13 },
-  cardArtist: { fontFamily: 'Courier New', fontSize: 8, color: colors.goldDim, marginTop: 2 },
-  cardDuration: { fontFamily: 'Courier New', fontSize: 8, color: colors.textFaint, marginTop: 1 },
+  progressTrack: {
+    position: 'absolute', bottom: 56, left: 0, right: 0,
+    height: 3, backgroundColor: COLORS.obsidianBorder,
+  },
+  progressFill: { height: 3, backgroundColor: COLORS.gold },
 
-  empty: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: spacing.xxl },
-  emptyIcon: { fontSize: 48, color: colors.goldDim, marginBottom: spacing.xl },
-  emptyTitle: { fontFamily: 'Courier New', fontSize: 14, color: colors.text, letterSpacing: 2, marginBottom: spacing.sm },
-  emptySub: { fontFamily: 'Courier New', fontSize: 10, color: colors.textDim, textAlign: 'center' },
+  completedBadge: {
+    position: 'absolute', top: 8, right: 8,
+    backgroundColor: COLORS.gold, borderRadius: RADIUS.full,
+    width: 22, height: 22, alignItems: 'center', justifyContent: 'center',
+  },
+  completedText: { color: COLORS.obsidian, fontSize: 12, fontWeight: 'bold' },
 
-  floatingBar: {
-    position: 'absolute',
-    bottom: 20,
-    left: spacing.lg,
-    right: spacing.lg,
-    backgroundColor: 'rgba(20,20,20,0.95)',
-    borderWidth: 1,
-    borderColor: colors.gold,
-    borderRadius: radius.md,
-    overflow: 'hidden',
-    shadowColor: colors.gold,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 10,
-    elevation: 10,
-  },
-  floatingBarContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: spacing.sm,
-  },
-  floatingArt: {
-    width: 44,
-    height: 44,
-    borderRadius: radius.sm,
-    backgroundColor: colors.obsidianLight,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  floatingTextCol: {
-    flex: 1,
-    marginLeft: spacing.md,
-    justifyContent: 'center',
-  },
-  floatingTitle: { ...typography.title, fontSize: 13, color: colors.text },
-  floatingSubtitle: { fontFamily: 'Courier New', fontSize: 9, color: colors.goldDim, marginTop: 2, letterSpacing: 1 },
-  floatingIcon: { fontSize: 16, color: colors.gold, paddingHorizontal: spacing.md },
+  cardInfo: { padding: SPACING.sm },
+  cardTitle:  { color: COLORS.textPrimary, fontFamily: FONTS.mono, fontSize: 12, marginBottom: 2 },
+  cardAuthor: { color: COLORS.gold,        fontFamily: FONTS.mono, fontSize: 10 },
+  cardTracks: { color: COLORS.textDim,     fontFamily: FONTS.mono, fontSize: 10, marginTop: 2 },
+
+  empty: { flex: 1, alignItems: 'center', marginTop: 80 },
+  emptyText: { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 12, letterSpacing: 2 },
 });

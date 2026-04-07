@@ -1,250 +1,197 @@
-import React, { useCallback, useState, useEffect } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, Image, Dimensions } from 'react-native';
-import { colors, spacing, radius, typography } from '../theme/veritas';
-import MediaSyncService from '../services/MediaSyncService';
-import { SovereignFooter } from '../components/SovereignBranding';
+/**
+ * AlbumScreen.jsx — Album detail. Large cover, track list, vault download,
+ * chapter-aware playback, progress resumption.
+ */
 
-const { width: SCREEN_W } = Dimensions.get('window');
+import React, { useCallback, useState } from 'react';
+import {
+  View, Text, FlatList, TouchableOpacity,
+  StyleSheet, Dimensions, Modal, ActivityIndicator,
+} from 'react-native';
+import FastImage from 'react-native-fast-image';
+import LinearGradient from 'react-native-linear-gradient';
+import { COLORS, FONTS, SPACING, RADIUS } from '../theme/veritas';
+import MediaSyncService from '../services/MediaSyncService';
+import OfflineBufferService from '../services/OfflineBufferService';
+import StateLedgerService from '../services/StateLedgerService';
+import PlayerService from '../services/PlayerService';
+
+const { width: W } = Dimensions.get('window');
+
+function formatMs(ms) {
+  if (!ms) return '—';
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return `${h}h ${m % 60}m`;
+  return `${m}m ${s % 60}s`;
+}
 
 export default function AlbumScreen({ route, navigation }) {
   const { album } = route.params;
-  const [tracks] = useState(album.tracks || []);
-  const [vaultState, setVaultState] = useState('UNCACHED'); // UNCACHED | DOWNLOADING | VAULTED
+  const tracks    = album.tracks || [album];
 
-  const coverUrl = MediaSyncService.getHttpUrl(`/cover/${album.id}`);
+  const [downloading, setDownloading] = useState({});
+  const [progresses,  setProgresses]  = useState({});
 
-  useEffect(() => {
-    import('../services/OfflineBufferService').then((module) => {
-      const OfflineBufferService = module.default;
-      
-      const checkState = () => {
-        let downloadedCount = 0;
-        let isDownloading = false;
-        
-        tracks.forEach(track => {
-          if (OfflineBufferService.isBuffered(track.id)) downloadedCount++;
-          if (OfflineBufferService.queue.some(q => q.trackId === track.id) || 
-              OfflineBufferService.currentDownload?.trackId === track.id) {
-            isDownloading = true;
-          }
-        });
+  const playTrack = useCallback(async (track, index) => {
+    const resumePos = StateLedgerService.getLastPosition(track.id || track.path);
+    // Check if buffered/vaulted
+    const localPath = OfflineBufferService.getBufferPath(track.path || track.id);
+    const enriched  = localPath ? { ...track, localPath } : track;
 
-        if (downloadedCount === tracks.length && tracks.length > 0) setVaultState('VAULTED');
-        else if (isDownloading) setVaultState('DOWNLOADING');
-        else setVaultState('UNCACHED');
-      };
+    await PlayerService.loadAlbum(tracks, index, resumePos);
+    navigation.getParent()?.navigate?.('NowPlaying');
+  }, [tracks, navigation]);
 
-      checkState();
+  const vaultTrack = useCallback(async (track) => {
+    if (OfflineBufferService.isVaulted(track.path || track.id)) return;
+    const key = track.id || track.path;
+    setDownloading(d => ({ ...d, [key]: true }));
 
-      const unsubQueue = OfflineBufferService.on('queue_updated', checkState);
-      const unsubStart = OfflineBufferService.on('download_start', checkState);
-      const unsubDone = OfflineBufferService.on('download_complete', checkState);
-      const unsubErr = OfflineBufferService.on('download_error', checkState);
-
-      return () => {
-        unsubQueue?.(); unsubStart?.(); unsubDone?.(); unsubErr?.();
-      };
+    await OfflineBufferService.vaultTrack(track, (pct) => {
+      setProgresses(p => ({ ...p, [key]: pct }));
     });
-  }, [tracks]);
 
-  const handleTrackPress = useCallback((track) => {
-    navigation.navigate('NowPlaying', { 
-      track: { ...track, title: track.title || album.name }, 
-      albumArt: coverUrl 
-    });
-  }, [navigation, coverUrl, album.name]);
+    setDownloading(d => ({ ...d, [key]: false }));
+    setProgresses(p => ({ ...p, [key]: 100 }));
+  }, []);
 
-  const handleDownloadPress = useCallback((track) => {
-    const url = MediaSyncService.getHttpUrl(`/stream/${track.id}`);
-    import('../services/OfflineBufferService').then((module) => {
-      module.default.queueDownload(track.id, url, track.filename, track.duration * 1024 * 1024 || 0, {
-        albumId: album.id,
-        albumName: album.name,
-        artist: album.artist,
-        coverUrl: coverUrl,
-        totalTracks: tracks.length
-      });
-    });
-  }, [album, coverUrl, tracks.length]);
+  const vaultAll = useCallback(async () => {
+    for (const track of tracks) {
+      await vaultTrack(track);
+    }
+  }, [tracks, vaultTrack]);
 
-  const handleDownloadBook = useCallback(() => {
-    if (vaultState !== 'UNCACHED') return;
-    import('../services/OfflineBufferService').then((module) => {
-      tracks.forEach(track => {
-        const url = MediaSyncService.getHttpUrl(`/stream/${track.id}`);
-        module.default.queueDownload(track.id, url, track.filename, track.duration * 1024 * 1024 || 0, {
-          albumId: album.id,
-          albumName: album.name,
-          artist: album.artist,
-          coverUrl: coverUrl,
-          totalTracks: tracks.length
-        }, true); // isPersistent = true
-      });
-      setVaultState('DOWNLOADING');
-    });
-  }, [tracks, album, coverUrl, vaultState]);
+  const renderTrack = useCallback(({ item: track, index }) => {
+    const key      = track.id || track.path;
+    const vaulted  = OfflineBufferService.isVaulted(key);
+    const dlActive = downloading[key];
+    const pct      = progresses[key];
+    const session  = StateLedgerService.getSession(key);
+    const resume   = session ? session.lastPos : 0;
 
-  const renderTrackItem = useCallback(({ item, index }) => (
-    <View style={styles.trackItem}>
-      <TouchableOpacity 
-        style={styles.trackTouchable} 
-        onPress={() => handleTrackPress(item)}
-      >
-        <Text style={styles.trackIndex}>{index + 1}.</Text>
-        <View style={styles.trackInfo}>
-          <Text style={styles.trackTitle} numberOfLines={1}>{item.title || album.name}</Text>
+    return (
+      <TouchableOpacity style={styles.trackRow} onPress={() => playTrack(track, index)}>
+        <View style={styles.trackLeft}>
+          <Text style={styles.trackNum}>{String(index + 1).padStart(2, '0')}</Text>
+          <View style={styles.trackMeta}>
+            <Text style={styles.trackTitle} numberOfLines={1}>{track.title || track.filename}</Text>
+            <View style={styles.trackSubRow}>
+              {track.durationMs && <Text style={styles.trackDur}>{formatMs(track.durationMs)}</Text>}
+              {resume > 0 && (
+                <Text style={styles.resumeTag}>↩ {formatMs(resume)}</Text>
+              )}
+            </View>
+          </View>
         </View>
-        <Text style={styles.trackDuration}>
-          {item.duration ? `${Math.floor(item.duration / 60)}:${(item.duration % 60).toString().padStart(2, '0')}` : '0:00'}
-        </Text>
+
+        <TouchableOpacity
+          style={styles.vaultBtn}
+          onPress={() => vaultTrack(track)}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        >
+          {dlActive
+            ? <Text style={styles.vaultIcon}>{pct ? `${pct}%` : '...'}</Text>
+            : vaulted
+              ? <Text style={[styles.vaultIcon, { color: COLORS.gold }]}>✓</Text>
+              : <Text style={styles.vaultIcon}>↓</Text>
+          }
+        </TouchableOpacity>
       </TouchableOpacity>
-      
-      <TouchableOpacity 
-        style={styles.downloadBtn} 
-        onPress={() => handleDownloadPress(item)}
-      >
-        <Text style={styles.downloadBtnText}>⬡</Text>
-      </TouchableOpacity>
-    </View>
-  ), [handleTrackPress, handleDownloadPress]);
+    );
+  }, [downloading, progresses, playTrack, vaultTrack]);
 
   return (
-    <View style={styles.container}>
+    <View style={styles.root}>
+      {/* Header */}
       <View style={styles.header}>
-        <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
-          <Text style={styles.backBtnText}>◀</Text>
-        </TouchableOpacity>
-        <Text style={styles.headerTitle} numberOfLines={1}>{album.name}</Text>
-        <View style={styles.spacer} />
-      </View>
-
-      <View style={styles.albumMeta}>
-        <Image 
-          source={{ 
-            uri: coverUrl, 
-            headers: { 
-              'Bypass-Tunnel-Reminder': 'true', 
-              'User-Agent': 'localtunnel' 
-            } 
-          }} 
-          style={styles.albumCover} 
-          defaultSource={null} 
+        <FastImage
+          style={styles.headerBg}
+          source={{
+            uri: MediaSyncService.buildCoverUrl(album.coverHash) || album.artwork,
+            headers: MediaSyncService.getRequestHeaders(),
+          }}
+          resizeMode={FastImage.resizeMode.cover}
+          blurRadius={12}
         />
-        <Text style={styles.albumArtist}>{album.artist || 'Unknown Artist'}</Text>
-        <Text style={styles.albumCount}>{tracks.length} episodes/tracks</Text>
-        
-        <TouchableOpacity 
-          style={[
-            styles.downloadBookBtn, 
-            vaultState === 'VAULTED' && styles.downloadBookBtnVaulted,
-            vaultState === 'DOWNLOADING' && styles.downloadBookBtnWait
-          ]} 
-          onPress={handleDownloadBook}
-          activeOpacity={vaultState === 'UNCACHED' ? 0.7 : 1}
-        >
-          <Text style={[
-            styles.downloadBookBtnText,
-            vaultState === 'VAULTED' && { color: colors.obsidian }
-          ]}>
-            {vaultState === 'VAULTED' ? '✓ VAULTED OFFLINE' : vaultState === 'DOWNLOADING' ? '⚡ DOWNLOADING...' : '⚡ DOWNLOAD BOOK'}
-          </Text>
-        </TouchableOpacity>
+        <LinearGradient
+          colors={['transparent', COLORS.obsidian]}
+          style={styles.gradient}
+        />
+        <View style={styles.headerContent}>
+          <FastImage
+            style={styles.coverArt}
+            source={{
+              uri: MediaSyncService.buildCoverUrl(album.coverHash) || album.artwork,
+              headers: MediaSyncService.getRequestHeaders(),
+            }}
+            resizeMode={FastImage.resizeMode.cover}
+          />
+          <View style={styles.headerMeta}>
+            <Text style={styles.albumTitle}>{album.title}</Text>
+            <Text style={styles.albumAuthor}>{album.author}</Text>
+            <Text style={styles.albumStats}>
+              {tracks.length} track{tracks.length !== 1 ? 's' : ''} · {formatMs(album.durationMs)}
+            </Text>
+          </View>
+        </View>
       </View>
 
+      {/* Vault All Button */}
+      <TouchableOpacity style={styles.vaultAllBtn} onPress={vaultAll}>
+        <Text style={styles.vaultAllText}>↓ VAULT ENTIRE ALBUM</Text>
+      </TouchableOpacity>
+
+      {/* Track List */}
       <FlatList
         data={tracks}
-        renderItem={renderTrackItem}
-        keyExtractor={item => item.id}
+        keyExtractor={(item) => item.id || item.path}
+        renderItem={renderTrack}
         contentContainerStyle={styles.trackList}
-        showsVerticalScrollIndicator={false}
-        ListFooterComponent={<SovereignFooter />}
+        ItemSeparatorComponent={() => <View style={styles.separator} />}
       />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.obsidian },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: spacing.md,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    paddingTop: 50,
-    backgroundColor: colors.obsidianLight,
-  },
-  backBtn: { padding: spacing.sm, marginRight: spacing.sm },
-  backBtnText: { color: colors.gold, fontSize: 18 },
-  headerTitle: { flex: 1, ...typography.title, fontSize: 14, color: colors.text, textAlign: 'center' },
-  spacer: { width: 40 },
-  
-  albumMeta: {
-    alignItems: 'center',
-    paddingVertical: spacing.xl,
-    paddingHorizontal: spacing.lg,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.obsidianLight,
-  },
-  albumCover: {
-    width: SCREEN_W * 0.45,
-    height: SCREEN_W * 0.45,
-    borderRadius: radius.md,
-    backgroundColor: colors.obsidianLight,
-    marginBottom: spacing.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  albumArtist: { fontFamily: 'Courier New', fontSize: 13, color: colors.gold, letterSpacing: 1, marginBottom: 4 },
-  albumCount: { fontFamily: 'Courier New', fontSize: 10, color: colors.textDim },
+  root: { flex: 1, backgroundColor: COLORS.obsidian },
 
-  trackList: { padding: spacing.md, paddingBottom: 100 },
-  trackItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: spacing.md,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.obsidianLight,
+  header:      { height: 220, position: 'relative' },
+  headerBg:    { ...StyleSheet.absoluteFillObject },
+  gradient:    { ...StyleSheet.absoluteFillObject },
+  headerContent: {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    flexDirection: 'row', padding: SPACING.md, alignItems: 'flex-end',
   },
-  trackTouchable: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
+  coverArt: { width: 100, height: 100, borderRadius: RADIUS.md, borderWidth: 1, borderColor: COLORS.gold },
+  headerMeta: { flex: 1, marginLeft: SPACING.md },
+  albumTitle:  { color: COLORS.textPrimary, fontFamily: FONTS.mono, fontSize: 16, fontWeight: 'bold' },
+  albumAuthor: { color: COLORS.gold, fontFamily: FONTS.mono, fontSize: 12, marginTop: 4 },
+  albumStats:  { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 11, marginTop: 4 },
+
+  vaultAllBtn: {
+    marginHorizontal: SPACING.md, marginVertical: SPACING.sm,
+    borderWidth: 1, borderColor: COLORS.gold, borderRadius: RADIUS.md,
+    paddingVertical: SPACING.sm, alignItems: 'center',
   },
-  trackIndex: { fontFamily: 'Courier New', fontSize: 11, color: colors.textFaint, width: 30 },
-  trackInfo: { flex: 1, paddingRight: spacing.sm },
-  trackTitle: { fontFamily: 'Courier New', fontSize: 13, color: colors.text },
-  trackDuration: { fontFamily: 'Courier New', fontSize: 11, color: colors.goldDim, marginRight: spacing.md },
-  
-  downloadBtn: {
-    padding: spacing.sm,
+  vaultAllText: { color: COLORS.gold, fontFamily: FONTS.mono, fontSize: 11, letterSpacing: 2 },
+
+  trackList: { paddingBottom: 120 },
+  separator: { height: 1, backgroundColor: COLORS.obsidianBorder, marginLeft: SPACING.md + 40 },
+
+  trackRow: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm + 2,
   },
-  downloadBtnText: {
-    color: colors.gold,
-    fontSize: 18,
-  },
-  downloadBookBtn: {
-    marginTop: spacing.lg,
-    backgroundColor: colors.obsidianMid,
-    borderWidth: 1,
-    borderColor: colors.gold,
-    paddingHorizontal: spacing.xl,
-    paddingVertical: spacing.md,
-    borderRadius: radius.md,
-  },
-  downloadBookBtnWait: {
-    borderColor: colors.goldDim,
-    backgroundColor: colors.obsidian,
-  },
-  downloadBookBtnVaulted: {
-    backgroundColor: colors.gold,
-    borderColor: colors.gold,
-  },
-  downloadBookBtnText: {
-    fontFamily: 'Courier New',
-    fontSize: 11,
-    color: colors.gold,
-    fontWeight: 'bold',
-    letterSpacing: 2,
-  }
+  trackLeft:  { flex: 1, flexDirection: 'row', alignItems: 'center' },
+  trackNum:   { color: COLORS.gold, fontFamily: FONTS.mono, fontSize: 12, width: 28 },
+  trackMeta:  { flex: 1 },
+  trackTitle: { color: COLORS.textPrimary, fontFamily: FONTS.mono, fontSize: 13 },
+  trackSubRow:{ flexDirection: 'row', alignItems: 'center', marginTop: 2 },
+  trackDur:   { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 10 },
+  resumeTag:  { color: COLORS.gold, fontFamily: FONTS.mono, fontSize: 10, marginLeft: SPACING.sm },
+  vaultBtn:   { paddingHorizontal: SPACING.sm },
+  vaultIcon:  { color: COLORS.textDim, fontFamily: FONTS.mono, fontSize: 14 },
 });
