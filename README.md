@@ -1,4 +1,5 @@
 <div align="center">
+  <img src="https://raw.githubusercontent.com/VrtxOmega/Gravity-Omega/master/omega_icon.png" width="100" alt="VERITAS" />
   <h1>SOVEREIGN MEDIA MOBILE</h1>
   <p><strong>Android Companion for Sovereign Media</strong></p>
   <p><em>Your library. Your pocket. Your sovereignty.</em></p>
